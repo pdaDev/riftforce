@@ -1,6 +1,5 @@
 import { FC, ReactNode, useMemo } from "react";
-import { Draft } from "../Classes/Class";
-import { TurnComponent } from "./TurnComponent";
+import { Draft, DraftStage } from "../Classes/Class";
 import { GuildsPoolComponent } from "./GuildsPoolComonent";
 import { UserDraftComponent } from "./UserDraftComponent";
 import { observer } from "mobx-react-lite";
@@ -15,17 +14,31 @@ export const DraftComponent: FC<IProps> = observer(({ draft }) => {
     const usersDraftsNodes = useMemo(() => {
         const userDraftsComponents: ReactNode[] = []
     
-        for (let [user, draft] of usersDraft.entries()) {
-            userDraftsComponents.push(<UserDraftComponent user={user} draft={draft}  key={user.id} />)
+        for (let [user, guilds] of usersDraft.entries()) {
+            userDraftsComponents.push(
+            <UserDraftComponent 
+                hasBan={draft.hasBanStage}
+                user={user}
+                currentTurn={turn.currentTurn}
+                draft={guilds}
+                key={user.id}
+             />)
         }
 
         return userDraftsComponents
     }, [usersDraft])
 
+    const stageName: Record<DraftStage, string> = {
+        [DraftStage.ban]: 'Бан',
+        [DraftStage.pick]: 'Пик'
+    }
+
     return (
      <div>
-        <TurnComponent turn={turn} />
+        { draft.hasBanStage ? stageName[draft.currentStage] : null }
+        <div className="rounded-lg flex flex-col gap-2 mb-5 bg-white shadow-md w-fit p-4 ">
         { usersDraftsNodes }
+        </div>
         <GuildsPoolComponent pool={guilds} />
     </div>
     )

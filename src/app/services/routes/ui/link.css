@@ -1,0 +1,9 @@
+a:visited {
+    appearance: none;
+    color: inherit;
+}
+
+a {
+    appearance: none;
+    text-decoration: none;
+}

@@ -1,11 +1,13 @@
-import { useState } from 'react'
-import { GameStateComponent } from './Components/GameStateComponent'
+import { AppRoutes, CommonLayoutWrapper } from "./app/services/routes"
+import { BrowserRouter } from "react-router-dom"
 
 function App() {
-  return (
-    <div className='bg-zinc-100'>
-      <GameStateComponent/>
-    </div>
+  return  (
+    <BrowserRouter>
+      <CommonLayoutWrapper>
+        <AppRoutes/> 
+      </CommonLayoutWrapper>
+    </BrowserRouter>
   )
 }
 

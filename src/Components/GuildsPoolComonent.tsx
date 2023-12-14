@@ -10,7 +10,11 @@ interface IProps {
 export const GuildsPoolComponent: FC<IProps> = observer(({ pool }) => {
     const { guilds } = pool
 
-    return <div className="grid container gap-4 w-fit grid-cols-5">
-        { guilds.map(guild => <GuildCardComponent key={guild.guild.code} card={guild} />) }
+    return (
+    <div className="w-full flex justify-center">
+        <div className="grid container gap-4 w-fit grid-cols-5">
+            { guilds.map(guild => <GuildCardComponent key={guild.guild.code} card={guild} />) }
+        </div>
     </div>
+    )
 })

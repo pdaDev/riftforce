@@ -451,7 +451,6 @@ export class ListManagerStore<T> {
                 this.stopLoading()
 
             } catch (e) {
-                console.log('одна ошибка и ты ошибся')
                 this.stopLoading()
             }     
         }     

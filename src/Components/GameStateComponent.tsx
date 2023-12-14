@@ -1,25 +1,26 @@
 import { FC, ReactNode } from "react";
-import { useStore } from "../app/Context";
-import { DraftComponent } from "./DraftComponent";
-import { Draft, GameEnd, GameProcess, GameRoom, GameStageCode } from "../Classes/Class";
-import { GameProcessComponent } from "./GameProcessComponent";
-import { observer } from "mobx-react-lite";
-import { RoomComponent } from "./RoomComponent";
-import { GameEndComponent } from "./EndGameComponent";
+
+import { GameRoom, GameState, InGameStageController } from "../Classes/Class";
+import { observer } from "mobx-react-lite"
+import { StageCode} from "../Classes/namespace";
+import { GameRoomComponent } from "./GameRoomComponent";
+import { InGameStageControllerComponent } from "./InGameStageControllerComponent";
 
 
-export const GameStateComponent: FC = observer(() => {
-    const { gameState } = useStore()
-    const { currentStage } = gameState
+interface IProps {
+    state: GameState
+}
 
-    const stagesComponents: Record<GameStageCode, ReactNode> = {
-        'GAME': <GameProcessComponent process={currentStage as GameProcess} />,
-        'DRAFT': <DraftComponent  draft={currentStage as Draft} />,
-        'END': <GameEndComponent gameEnd={currentStage as GameEnd} />,
-        'ROOM': <RoomComponent gameRoom={currentStage as GameRoom}/>
+export const GameStateComponent: FC<IProps> = observer(({ state }) => {
+    const { currentStage } = state
+
+    const stagesComponents: Partial<Record<StageCode, ReactNode>> = {
+        [StageCode.game]: <InGameStageControllerComponent controller={currentStage as InGameStageController} />,
+        // [StageCode.end]: <GameEndComponent gameEnd={currentStage as GameEnd} />,
+        [StageCode.room]: <GameRoomComponent gameRoom={currentStage as GameRoom}/>
     }
 
     return <div>
-       { currentStage && stagesComponents[currentStage.code] }
+       { currentStage && stagesComponents[currentStage.code as StageCode] }
     </div>
 })

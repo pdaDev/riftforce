@@ -10,6 +10,7 @@ interface IProps {
 
 export const GuildsListComponent: FC<IProps> = observer(({ banned, guilds }) => {
     return <div className="flex gap-5 ">
+        { banned && 'Забанены' }
         { Array.from(guilds).map(g => <GuildComponent guild={g}
                                           key={g.code}
                                           banned={banned}

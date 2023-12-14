@@ -1,4 +1,4 @@
-import { FC, MouseEventHandler, ReactNode } from "react";
+import { FC, ReactNode } from "react";
 import { SelectiveElement } from "../Classes/Class";
 import { observer } from "mobx-react-lite";
 
@@ -10,11 +10,11 @@ interface IProps {
 
 export const SelectiveElementComponent: FC<IProps> = observer(
     ({ element, children }) => {
-        const { highlighted, select } = element
+        const { highlighted, onSelect } = element
 
         return (
-            <div className={`border-2  ${highlighted && 'cursor-pointer border-red-300'}`} 
-                 onClick={select as MouseEventHandler}
+            <div className={`border-2  shadow-md rounded-lg ${highlighted ? 'cursor-pointer border-amber-300' : 'border-transparent'}`} 
+                 onClick={onSelect}
             >
                 { children }
             </div>

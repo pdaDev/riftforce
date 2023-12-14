@@ -1,0 +1,7 @@
+
+
+.popover_reset  .MuiPaper-elevation  {
+    box-shadow: none !important;
+    background: transparent !important;
+    overflow: visible !important;
+}

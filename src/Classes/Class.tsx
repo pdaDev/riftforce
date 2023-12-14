@@ -1,86 +1,127 @@
 import { action, computed, makeAutoObservable, makeObservable, observable } from 'mobx'
 // @ts-ignore
 import { v4 as uuid } from 'uuid'
+import { io } from 'socket.io-client'
+import { ServerRoomPropsPayload } from '../features/rooms'
+import { DraftStage, HTTPAxiosAPI, ValidationField, RoomType, NotificationService, NotificationType, NotificationVariant } from '../shared'
+import * as yup from 'yup'
+import { AuthUserController } from '../features/auth/model/store'
+import { DeckMapper, ElementalMapper, CardsControllerMapper, UserDraftMapper, UserMapper, GameRoomPropsMapper, GuildsPoolMapper, FieldsControllerMapper, RoomTeamMapper } from './Mapper'
+import { BASE_GUILDS_CODE, ADD_GUILDS, LS_PLAYED_GAMES_KEY, WEBSOCKET_SERVER_PATH } from './constants'
+import { GuildCode, MobDataCode, UserTuple, MapNodeCode, MapNodeWithUserCode, 
+    NodeNeighbors, ElementalCode, FullFieldCode, Command,
+     LogAction, ServerGameState, ServerFinalState, ServerUserFields,
+      ServerUserCards, ServerTeamPoints, ServerUserDrafts,
+      ServerUserDecks, LogPayload, UsersCards, LogInstigatorType,
+       ServerUserPicks, DraftConfig, DefaultPicks, DefaultProcessGameState,
+        PrevState, Log, LogSideEffect, CommandFormatter, HighlightElementConfig,
+         HighlightElementConfigForGetActions, CardWithoutResultHandler, 
+         EqualFunction, FieldHandler, FieldHandlerWithNoResult, 
+         GameProcessUpdateAllStatePayload, DraftUpdateAllStatePayload,
+          NextTurnSideEffect, GameStrategyCodeType, StrategyController, 
+          TimerChangeTimeSideEffect, ChatAPI, 
+          ChatController, IGameAPI, IInGameStageController, IStageController,
+           InGameCode, InGameStageControllerDefaultData, InteractionType,
+            LogReader, Mediator, StageCode, UserType, LogInstigator, GameType, ILoggingGameAPI, ISyncGameAPI, GameStatePayload, WebsocketEvents, RedisState, PlayedGame, WEBSOCKET_EVENTS, ServerUser } from './namespace'
+import { privateApi } from '../shared/api/jwt.api'
+
+
+
+const getRandomElement = (array: any[]) => {
+    return array [Math.floor(Math.random() * (array.length - 1))]!
+}
+
 
 export class SelectiveElement {
-    available: boolean = false
+    available: boolean = true
+    clickable: boolean = false
     protected mediator: Mediator
-    justHighlighted: boolean = false
-    select: Function
+    highlighted: boolean = false
 
     constructor (mediator: Mediator) {
         this.mediator = mediator
-        this.select = this.clickObserver('select').bind(this) 
+        
         makeObservable(this, {
             available: observable,
-            justHighlighted: observable,
-            highlighted: computed,
+            highlighted: observable,
             setAvailable: action,
             highlight: action,
         })
     }
 
+    select = () => this.interact('select')
+    onSelect = () => this.handleInteract(this.select)
+
     setAvailable = (value: boolean) => {
         this.available = value
     } 
 
-    highlight = (value: boolean, clickable: boolean = true) => {
-        this.justHighlighted = value
-        this.available = clickable ? value : false
+    setClickable = (status: boolean) => {
+        this.clickable = status
     }
 
-    get highlighted () {
-        return this.available || this.justHighlighted
+    setHighlighted = (status: boolean) => {
+        this.highlighted = status
     }
 
-    clickObserver = (message?: string, condition: boolean = true) => () => {
-        if (this.available && condition) {
-            this.mediator.notify(this, message || 'click')
+    highlight = (status: boolean, available: boolean, clickable: boolean) => {
+        this.setHighlighted(status)
+        this.setAvailable(available)
+        this.setClickable(clickable)
+    }
+
+    interact = (message: string, extra?: unknown) => {
+        if (this.available) {
+            this.mediator.notify(this, message || 'click', extra)
         }
-    } 
+    }
+
+    handleInteract = (cb: Function) => {
+        if (this.clickable && this.available) {
+            cb()
+        }
+    }
 }
-
-
 
 export abstract class Guild {
     abstract readonly action: string[]
-    readonly code: string
+    readonly code: GuildCode
     abstract readonly name: string
     abstract readonly icon: string 
     abstract readonly color: string
     readonly extraPointsForDeath: number = 0
     readonly pointsForKill: number = 1
 
-    constructor (code: string) {
+    constructor (code: GuildCode) {
         this.code = code
     }
 
-    spawn = async (field: Field, fields: FieldsController, killer: Killer, cards: CardsController): Promise<any> => {
-        console.log(field, fields, killer, cards)
+    spawn = (_: Field, __: FieldsController, ___: Killer, ____: CardsController, onFinish: Function) => {
+        onFinish()
     }
    
-    abstract activate (field: Field, fields: FieldsController, killer: Killer, cards: CardsController): Promise<any>
+    abstract activate (field: Field, fields: FieldsController, killer: Killer, cards: CardsController, onFinish: Function): void
 
     protected attackFirstInCol = (field: Field, fields: FieldsController, killer: Killer, damage: number) => {
-        const elemental = fields.getFirstElementalFieldInThisColSync(field)
+        const elemental = fields.getFirstEnemyElementalFieldInThisColSync(field)
 
         if (elemental) {
             killer.hit(field, elemental, damage)
         }
     }
 
-    protected transferToAny = async (field: Field, fields: FieldsController) => {
-        const newPlace = await fields.getMyAnyLastEmptyFieldAsync(field)
-        fields.transferElementalToNewField(field, newPlace!)
-
-        return newPlace!
+    protected transferToAny = (field: Field, fields: FieldsController, cb: FieldHandler) => {
+        fields.getTeamAnyLastEmptyFieldAsync(field.parent.user![1], [field.parent], newPlace => {
+            fields.transferElementalToNewField(field, newPlace!)
+            cb(newPlace)
+        })
     }
 
-    protected transferToNeighbors = async (field: Field, fields: FieldsController) => {
-        const newPlace = await fields.getMyNeighBoorLastEmptyFieldAsync(field)
-        fields.transferElementalToNewField(field, newPlace!)
-
-        return newPlace!
+    protected transferToNeighbors = (field: Field, fields: FieldsController, cb: FieldHandler) => {
+        fields.getNeighBoorLastEmptyFieldAsync(field, newPlace => {
+            fields.transferElementalToNewField(field, newPlace!)
+            cb(newPlace)
+        })
     } 
 }
 
@@ -90,14 +131,14 @@ export class IceGuild extends Guild {
     readonly icon: string = ''
     readonly color: string = 'blue-200'
 
-    activate = async (field: Field, fields: FieldsController, killer: Killer) => {
+    activate = (field: Field, fields: FieldsController, killer: Killer, _: CardsController, onFinish: Function) => {
         const elemental = fields.getLastEnemyElementalInThisColSync(field)
-        
         if (elemental) {
             const damage =elemental.elemental!.health < elemental.elemental!.maxHealth ? 4 : 1
-            
             killer.hit(field, elemental, damage)
         }
+
+        onFinish()
     }
 }
 
@@ -107,10 +148,16 @@ export class LightGuild extends Guild {
     readonly icon: string = ''
     readonly color: string = 'yellow-400'
 
-    activate = async (field: Field, fields: FieldsController, killer: Killer) => {
+    activate = (field: Field, fields: FieldsController, killer: Killer, _: CardsController, onFinish: Function) => {
         this.attackFirstInCol(field, fields, killer, 2);
+    
+        fields.getTeamAnyElementalAsync(field.parent.user![1], [], field => {
+            if (field) {
+                field.elemental!.heal(1)
+            }
 
-        (await fields.getMyAnyElementalAsync())!.elemental!.heal(1)
+            onFinish()
+        })
     }
 }
 
@@ -120,12 +167,14 @@ export class FireGuild extends Guild {
     readonly icon: string = ''
     readonly color: string = 'red-500'
 
-    activate = async (field: Field, fields: FieldsController, killer: Killer) => {
+    activate = (field: Field, fields: FieldsController, killer: Killer, _: CardsController, onFinish: Function) => {
         this.attackFirstInCol(field, fields, killer, 3)
 
         if (field.next && field.next.elemental) {
             killer.hit(field, field.next, 1)
         }
+
+        onFinish()
     }
 }
 
@@ -136,8 +185,10 @@ export class CrystalGuild extends Guild {
     readonly color: string = 'indigo-100'
     readonly extraPointsForDeath: number = 1
 
-    activate = async (field: Field, fields: FieldsController, killer: Killer) => {
+    activate = (field: Field, fields: FieldsController, killer: Killer, _: CardsController, onFinish: Function) => {
         this.attackFirstInCol(field, fields, killer, 4)
+
+        onFinish()
     }
 }
 
@@ -147,10 +198,12 @@ export class WaterGuild extends Guild {
     readonly icon: string = ''
     readonly color: string = 'blue-400'
 
-    activate = async (field: Field, fields: FieldsController, killer: Killer) => {
+    activate = (field: Field, fields: FieldsController, killer: Killer, _: CardsController, onFinish: Function) => {
         this.attackFirstInCol(field, fields, killer, 2)
-        const newPlace = await this.transferToNeighbors(field, fields)
-        this.attackFirstInCol(newPlace!, fields, killer, 1)
+        this.transferToNeighbors(field, fields, newPlace => {
+            this.attackFirstInCol(newPlace!, fields, killer, 1)
+            onFinish()
+        })
     }
 }
 
@@ -160,12 +213,13 @@ export class AirGuild extends Guild {
     readonly icon: string = ''
     readonly color: string = 'grey-200'
 
-    activate = async (field: Field, fields: FieldsController, killer: Killer) => {
-        const newPlace = await this.transferToAny(field, fields)
-
-        fields.getEnemyFirstElementalsInThreeColsSync(newPlace!).forEach(f => {
-            killer.hit(newPlace, f, 1)
-        })
+    activate = (field: Field, fields: FieldsController, killer: Killer, _: CardsController, onFinish: Function) => {
+       this.transferToAny(field, fields, newPlace => {
+            fields.getEnemyFirstElementalsInThreeColsSync(newPlace!).forEach(f => {
+                killer.hit(newPlace, f, 1)
+            })
+            onFinish()
+       })
     }
 }
 
@@ -176,8 +230,11 @@ export class DarkGuild extends Guild {
     readonly color: string = 'grey-800'
     readonly pointsForKill: number = 2
 
-    activate = async (field: Field, fields: FieldsController, killer: Killer) => {
-        this.attackFirstInCol(field, fields, killer, 2)
+    activate = (field: Field, fields: FieldsController, killer: Killer, _: CardsController, onFinish: Function) => {
+        this.transferToAny(field, fields, newPlace => {
+            this.attackFirstInCol(newPlace, fields, killer, 1)
+            onFinish()
+        })
     }
 }
 
@@ -187,14 +244,16 @@ export class FloraGuild extends Guild {
     readonly icon: string = ''
     readonly color: string = 'green-500'
 
-    activate = async (field: Field, fields: FieldsController, killer: Killer) => {
-        const neighboor = await fields.getNeighBoorEnemyFirstElementalAsync(field)
-        
-        if (neighboor) {
-            killer.hit(field, neighboor, 2)
+    activate = (field: Field, fields: FieldsController, killer: Killer, _: CardsController, onFinish: Function) => {
+        fields.getNeighBoorEnemyFirstElementalAsync(field, neighboor => {
+            if (neighboor) {
+                killer.hit(field, neighboor, 2)
+    
+                fields.transferElementalToNewField(neighboor, fields.getLastFieldInNode(field.parent.up!))
+            }
 
-            fields.transferElementalToNewField(neighboor, fields.getLastFieldInNode(field.parent.up!))
-        }
+            onFinish()
+        })
     }
 }
 
@@ -204,26 +263,22 @@ export class LightingGuild extends Guild {
     readonly icon: string = ''
     readonly color: string = 'indigo-600'
 
-    activate = async (field: Field, fields: FieldsController, killer: Killer) => {
-        let canRepeate = false
-        do {
-            const enemy = await fields.getEnemyAnElementalInThisNode(field)
-  
-            if (enemy) {
-                const damage = 2
+    activate = (field: Field, fields: FieldsController, killer: Killer, _: CardsController, onFinish: Function) => {
+        const iterate = () => {
+            fields.getEnemyAnyElementalInThisNodeAsync(field, enemy => {
+                if (enemy) {
+                    const damage = 2
+                    const previousHealth = enemy.elemental!.health
+                    killer.hit(field, enemy, damage)
 
-                if (enemy.elemental!.health <= damage) {
-                    canRepeate = true
-                } else {
-                    canRepeate = false
+                    if (previousHealth <= damage) {
+                        iterate()
+                    }
                 }
-
-                killer.hit(field, enemy, damage)
-            } else {
-                canRepeate = false
-            }
-            
-        } while (canRepeate)
+            }) 
+        }
+        iterate()
+        onFinish()
     }
 }
 
@@ -233,14 +288,16 @@ export class GroundGuild extends Guild {
     readonly icon: string = ''
     readonly color: string = 'yellow-800'
 
-    activate = async (field: Field, fields: FieldsController, killer: Killer) => {
+    activate = (field: Field, fields: FieldsController, killer: Killer, _: CardsController, onFinish: Function) => {
         this.attackFirstInCol(field, fields, killer, 2)
+        onFinish()
     }
 
-    spawn = async (field: Field, fields: FieldsController, killer: Killer) => {
+    spawn = (field: Field, fields: FieldsController, killer: Killer, _: CardsController, onFinish: Function) => {
         fields.getEnemyAllElementalsInThisNodeSync(field).forEach(enemy => {
-            killer.hit(field, enemy, 2)
+            killer.hit(field, enemy, 1)
         })
+        onFinish()
     }
 }
 
@@ -251,10 +308,11 @@ export class AcidGuild extends Guild {
     readonly color: string = 'green-200'
     readonly pointsForKill: number = 0
 
-    activate = async (field: Field, fields: FieldsController, killer: Killer) => {
+    activate = (field: Field, fields: FieldsController, killer: Killer, _: CardsController, onFinish: Function) => {
         const enemies = fields.getEnemyAllElementalsInThisNodeSync(field)
         killer.hit(field, enemies[0], 3)
         killer.hit(field, enemies[1], 1)
+        onFinish()
     }
 }
 
@@ -264,12 +322,14 @@ export class CometGuild extends Guild {
     readonly icon: string = ''
     readonly color: string = 'blue-800'
 
-    activate = async (field: Field, fields: FieldsController, killer: Killer, cards: CardsController, ) => {
+    activate = (field: Field, fields: FieldsController, killer: Killer, cards: CardsController, onFinish: Function) => {
         this.attackFirstInCol(field, fields, killer, 2)
 
-        if (cards.handCardDeck.cards.length < 7) {
+        if (cards.hand.cards.length < 7) {
             cards.addCardsToHand(1)
         }
+
+        onFinish()
     }
 }
 
@@ -279,16 +339,19 @@ export class LoveGuild extends Guild {
     readonly icon: string = ''
     readonly color: string = 'purple-400'
 
-    activate = async (field: Field, fields: FieldsController, killer: Killer) => {
+    activate = (field: Field, fields: FieldsController, killer: Killer, _: CardsController, onFinish: Function) => {
         this.attackFirstInCol(field, fields, killer, 2)
+        onFinish()
     }
 
-    spawn = async (field: Field, fields: FieldsController) => {
-        const healedField = await fields.getMyAnyElementalInThisNodeAsync(field)
-        
-        if (healedField) {
-            healedField.elemental!.healToMax()
-        }
+    spawn = (field: Field, fields: FieldsController, __: Killer, _: CardsController, onFinish: Function) => {
+        fields.getAnyElementalInThisNodeAsync(field, healedField => {
+            if (healedField) {
+                healedField.elemental!.healToMax()
+            }
+
+            onFinish()
+        })
     }
 }
 
@@ -298,8 +361,8 @@ export class MusicGuild extends Guild {
     readonly icon: string = ''
     readonly color: string = 'zinc-200'
 
-    activate = async (field: Field, fields: FieldsController, killer: Killer, cards: CardsController,) => {
-        const enemy = fields.getFirstElementalFieldInThisColSync(field)
+    activate = (field: Field, fields: FieldsController, killer: Killer, cards: CardsController, onFinish: Function) => {
+        const enemy = fields.getFirstEnemyElementalFieldInThisColSync(field)
 
         if (enemy) {
             killer.hitWithoutDeath(field, enemy, 2)
@@ -308,11 +371,10 @@ export class MusicGuild extends Guild {
             if (enemyElemental.isDead) {
                 enemyElemental.healToMax()
 
-                const neighboorPlace = await fields.getMyNeighBoorLastEmptyFieldAsync(field)
-
-                fields.transferElementalToNewField(enemy, neighboorPlace!)
-
-                neighboorPlace!.elemental!.guild.spawn(neighboorPlace!, fields, killer,  cards)
+               fields.getNeighBoorLastEmptyFieldAsync(field, neighboorPlace => {
+                    fields.transferElementalToNewField(enemy, neighboorPlace)
+                    neighboorPlace!.elemental!.guild.spawn(neighboorPlace, fields, killer,  cards, onFinish)
+               })
             }
         }
     }
@@ -324,14 +386,15 @@ export class BeastGuild extends Guild {
     readonly icon: string = ''
     readonly color: string = 'red-90'
 
-    activate = async (field: Field, fields: FieldsController, killer: Killer) => {
-        const newPlace = await this.transferToNeighbors(field, fields)
-
-        const damage = newPlace.elemental!.health < newPlace.elemental!.maxHealth 
+    activate = (field: Field, fields: FieldsController, killer: Killer, _: CardsController, onFinish: Function) => {
+        this.transferToNeighbors(field, fields, newPlace => {
+            const damage = newPlace.elemental!.health < newPlace.elemental!.maxHealth 
             ? 3
             : 2
 
-        this.attackFirstInCol(newPlace, fields, killer, damage)
+            this.attackFirstInCol(newPlace, fields, killer, damage)
+            onFinish()
+        }) 
     }
 }
 
@@ -341,20 +404,23 @@ export class MagneticGuild extends Guild {
     readonly icon: string = ''
     readonly color: string = 'grey-600'
 
-    activate = async (field: Field, fields: FieldsController, killer: Killer) => {
+    activate = (field: Field, fields: FieldsController, killer: Killer, _: CardsController, onFinish: Function) => {
         const enemy = fields.getLastEnemyElementalInThisColSync(field)
 
         if (enemy) {
             killer.hit(field, enemy, 2)
         }
 
-        const neighbour = await fields.getMyNeighBoorLastEmptyFieldAsync(field)
-        fields.transferElementalToNewField(field, neighbour!)
+        fields.getNeighBoorLastEmptyFieldAsync(field, neighbour => {
+            fields.transferElementalToNewField(field, neighbour!)
        
-        if (enemy) {
-            const newEnemyPlace = fields.getLastFieldInNode(neighbour!.parent.up!)
-            fields.transferElementalToNewField(enemy, newEnemyPlace )
-        }  
+            if (enemy) {
+                const newEnemyPlace = fields.getLastFieldInNode(neighbour!.parent.up!)
+                fields.transferElementalToNewField(enemy, newEnemyPlace )
+            }  
+
+            onFinish()
+        })
     }
 }
 
@@ -364,14 +430,16 @@ export class SandGuild extends Guild {
     readonly icon: string = ''
     readonly color: string =  'yellow-100'
 
-    activate = async (field: Field, fields: FieldsController, killer: Killer) => {
-        const newPlace = await this.transferToAny(field, fields)
-
-        fields.getEnemyAllElementalsInThisNodeSync(field).forEach(enemy => {
-            killer.hit(newPlace, enemy, 1)
+    activate = (field: Field, fields: FieldsController, killer: Killer, _: CardsController, onFinish: Function) => {
+        this.transferToAny(field, fields, newPlace => {
+            const enemies =  fields.getEnemyAllElementalsInThisNodeSync(newPlace)
+            enemies.forEach(enemy => {
+                killer.hit(newPlace, enemy, 1)
+            })
+    
+            newPlace.elemental!.heal(1)
+            onFinish()
         })
-
-        newPlace.elemental!.heal(1)
     }
 }
 
@@ -381,29 +449,25 @@ export class LavaGuild extends Guild {
     readonly icon: string = ''
     readonly color: string = 'orange-600'
 
-    activate = async (field: Field, fields: FieldsController, killer: Killer) => {
+    activate = (field: Field, fields: FieldsController, killer: Killer, _: CardsController, onFinish: Function) => {
         const enemies = fields.getAllNeighBoorEnemyFirstElementalsSync(field)
-        const fieldsBefore = fields.getFieldsBeforeSync(field)
+        const fieldsBefore = fields.getFieldsWithElementalBeforeSync(field)
 
-        const attack: Field[] = [...enemies, ...fieldsBefore, field]
+        const myFieldsForAttack: Field[] = [...fieldsBefore, field]
 
-        attack.forEach(f => {
-            killer.hit(field, f, 2)
+        myFieldsForAttack.forEach(f => {
+            killer.hit(field, f, 1)
         })
+
+        enemies.forEach(f => {
+            killer.hit(field, f, 2)
+        }) 
+
+        onFinish()
     }
 }
 
-export const BASE_GUILDS_CODE = [
-    'ICE', 'LIGHT', 'FIRE', 'CRYSTAL', 'WATER',
-    'AIR', 'DARK', 'FLORA', 'LIGHTNING', 'GROUND'
-] as const
 
-export const ADD_GUILDS = [
-    'ACID', 'COMET', 'LOVE', 'MUSIC', 'BEAST',
-    'MAGNETIC', 'LAVA', 'SAND'
-] as const
-
-export type GuildCode = typeof BASE_GUILDS_CODE[number] | typeof ADD_GUILDS[number]
 
 export class GuildFactory {
     private static instance: GuildFactory
@@ -458,36 +522,54 @@ export class GuildFactory {
 export class MobData {
     readonly guild: Guild
     readonly value: number
-    readonly code: string
+    readonly code: MobDataCode
 
-    constructor(guild: Guild, value: number) {
+    constructor(guild: Guild, value: number, index = 0) {
         this.guild = guild
         this.value = value
-        this.code = `${guild.code}_${value}`
+        this.code = MobData.parseCode(guild.code as GuildCode, value, index)
+    }
+
+    static parseCode = (guild: GuildCode, value: number, index = 0): MobDataCode => {
+        return `${guild}_${value}_${index}`
     }
 }
 
-export interface Mediator<T = SelectiveElement> {
-    notify(target: T, message: string): void
-}
+
 
 export class User {
     readonly id: string
     readonly name: string
+    readonly email: string
     readonly avatar: null | string = null
     readonly rating: number
+    type: UserType
 
-    constructor (id: string, name: string, avatar: string | null, rating?: number) {
+    constructor (id: string, name: string,  email: string, avatar: string | null, rating?: number, type?: UserType) {
         this.id = id
         this.name = name
         this.avatar = avatar
+        this.email = email
         this.rating = rating || 0
+        this.type = type || UserType.user
+    }
+
+    setType = (type: UserType) => {
+        this.type = type
     }
 }
 
-export type UserTuple = [User, Team]
+export class AuthUser extends User {
+    readonly isAdmin: boolean
+    readonly activated: boolean
 
-type NodeNeighbors =  'up' | 'down' | 'next' | 'prev'
+    constructor(id: string, name: string,  email: string, avatar: string | null, rating: number, isAdmin: boolean, activated: boolean) {
+        super(id, name, email, avatar, rating, UserType.user)
+        this.activated = activated
+        this.isAdmin = isAdmin
+    }
+}
+
 
 export class MapNode {
     next: MapNode | null = null
@@ -498,17 +580,24 @@ export class MapNode {
     private mediator: Mediator
     readonly index: number = 0
     fields: Field[]
+    code: MapNodeCode 
 
     constructor (mediator: Mediator, user?: UserTuple, index?: number) {
         this.user = user || null
         this.mediator = mediator
         this.fields = []
-        
+        this.index = index || this.index
+
         if (user) {
             this.addField()
+            this.code = MapNode.parseCode(user[0].id, this.index)
+        } else {
+            this.code = this.index.toString()
         }
-       
-        this.index = index || this.index
+    }
+
+    static parseCode = (userId: string, index = 0): MapNodeWithUserCode => {
+        return `${userId}_${index}`
     }
 
     get lastField () {
@@ -530,12 +619,6 @@ export class MapNode {
         this.fields.push(field)
 
         return field
-    }
-
-    get code () {
-        if (this.user) 
-            return `${this.user[0].id}_${this.index}`
-        return this.index
     }
 
     removeField = (field: Field) => {
@@ -586,12 +669,18 @@ export class Field extends SelectiveElement {
         return this
     }
 
-    get code () {
+    select = () => this.interact(LOG_ACTIONS.select_field)
+
+    static parseCode = (nodeCode: MapNodeWithUserCode, elementalCode: ElementalCode): FullFieldCode => {
+        return `${nodeCode}_${elementalCode}`
+    }
+
+    get code (): FullFieldCode | MapNodeWithUserCode  {
         if (this.elemental && this.parent.user) {
-            return this.elemental.code
+            return Field.parseCode(this.parent.code as MapNodeWithUserCode, this.elemental.code)
         }
 
-        return this.parent.index
+        return this.parent.code as MapNodeWithUserCode
     }
 
     createElemental(data: MobData, helath?: number) {
@@ -601,6 +690,10 @@ export class Field extends SelectiveElement {
 
             this.parent.addField()
         }
+    }
+
+    setElemental = (elemental: Elemental) => {
+        this.elemental = elemental
     }
 
     delete () {
@@ -624,16 +717,18 @@ export class Field extends SelectiveElement {
 export class Elemental {
     health: number
     readonly mobData: MobData
-    readonly code: string
     
     constructor(data: MobData, currentHealth?: number) {
         this.mobData = data
         this.health = currentHealth || this.maxHealth
-        this.code = `${data.code}_${this.health}`
     }
 
     get maxHealth () {
         return this.mobData.value
+    }
+
+    get code (): ElementalCode {
+        return Elemental.parseCode(this.mobData.code, this.health)
     }
 
     get guild () {
@@ -643,6 +738,10 @@ export class Elemental {
     hit(damage: number) {
         this.health -= damage
     } 
+
+    static parseCode = (mobDataCode: MobDataCode, health: number): ElementalCode => {
+        return `${mobDataCode}_${health}`
+    }
 
     heal(hp: number) {
         this.health = Math.max(this.maxHealth, this.health + hp)
@@ -657,12 +756,34 @@ export class Elemental {
     }
 }
 
-export enum CardsActionMessages {
-    summon = 'SUMMON',
-    activate = 'ACTIVATE',
-    select = 'SELECT',
-    draw = 'DRAW'
-}
+
+
+enum InteractionsVariants {
+    guild = 'GUILD',
+    value = 'VALUE'
+} 
+
+export const LOG_ACTIONS = {
+    summon: 'SUMMON',
+    activate: 'ACTIVATE',
+    select_card: 'SELECT_CARD',
+    select_field: 'SELECT_FIELD',
+    start_stage: 'SART_STAGE',
+    stop_stage: 'STOP_STAGE',
+    select_guild: 'SELECT_GUILD',
+    draw: 'DRAW',
+    start_action_iteration: 'START_ACTION_ITERATION',
+    stop_turn: 'STOP_TURN',
+    activated: 'ACTIVATED',
+    spawned: 'SPAWNED',
+    die: "DIE",
+    pick: 'PICK',
+    switch_turn: "SWITCH_TURN",
+    ban: 'BAN',
+    hit:  (damage: number) => `HIT_${damage}`,
+    spawnBy: (type: keyof typeof InteractionsVariants) => `SPAWNED_BY_${InteractionsVariants[type]}`,
+    activateBy: (type: keyof typeof InteractionsVariants) => `ACTIVATE_BY_${InteractionsVariants[type]}`
+} as const
 
 
 export class Card extends SelectiveElement {
@@ -678,17 +799,24 @@ export class Card extends SelectiveElement {
         })
     }
 
+    summon = () => this.usable && this.interact(LOG_ACTIONS.summon, 'extra')
+    activate = () => this.usable && this.interact(LOG_ACTIONS.activate, 'extra')
+    select = () => !this.usable && this.interact(LOG_ACTIONS.select_card)
+
+    onSummon = () => this.handleInteract(this.summon)
+    onActivate = () => this.handleInteract(this.interact)
+
     setUsable = (status: boolean) => {
         this.usable = status
     }
-
-    summon = this.clickObserver(CardsActionMessages.summon, this.usable)
-    activate = this.clickObserver(CardsActionMessages.activate, this.usable)
-    select = this.clickObserver(CardsActionMessages.select, !this.usable)
 }
 
 export class Deck<T = MobData> {
     cards: T[] = []
+
+    constructor(cards?: T[]) {
+        cards && this.setCards(cards)
+    }
     
     add = (card: T) => {
         this.cards.push(card)
@@ -727,17 +855,36 @@ export class Deck<T = MobData> {
 }
 
 
-type Command<T  = unknown> = {
-    target: T
-    message: string
-}
+const initFormatter = (command: Command | null) => command
 
-export class BaseController implements Mediator {
-    enabled: boolean = false
+export abstract class BaseController implements Mediator {
+    enabled: boolean = true
     readonly highlighted: Set<SelectiveElement> = new Set<SelectiveElement>()
-    protected resolve: ((payload: Command) => void ) = (_: Command) => {}
+    protected resolve?: ((payload: any) => void)
+    private formatter: CommandFormatter = initFormatter
+    private clickable: boolean = false
+    private highlightable: boolean = false
+    private avaialbe: boolean = true
 
-    constructor() {
+    setHighlightable = (status: boolean) => {
+        if (this.enabled) {
+            this.highlightable = status
+        }
+    }
+
+    setAvaialbe = (status: boolean) => {
+        this.avaialbe = status
+        this.highlighted.forEach(el => el.setAvailable(status))
+    }
+
+    logAction: LogAction | undefined
+
+    setLogAction = (action: LogAction) => {
+        this.logAction = action
+    }
+
+    constructor(logAction?: LogAction) {
+        this.logAction = logAction
         makeObservable(this, {
             enabled: observable,
             setEnabled: action
@@ -745,40 +892,82 @@ export class BaseController implements Mediator {
         this.resetHighlights.bind(this)
     }
 
+    setClickable = (status: boolean) => {
+        if (this.enabled) {
+            this.clickable = status
+        }
+    }
+ 
     setEnabled = (status: boolean) => {
         this.enabled = status
+        this.setAvaialbe(status)
     }
 
-    notify(target: any, message: string): void {
-        this.resolve({ target, message })
+    protected formatCommand = (command: Command): any => {
+        return command
+    }
+    abstract getObservableElCode(el: SelectiveElement): string
+
+    notify(target: any, message: string, extra?: unknown): void {
+        if (this.resolve && this.enabled) {
+            this.resetHighlights()
+            const currentResolve = this.resolve
+
+            if (this.logAction) {
+                const type = extra && typeof extra === "string" ? extra as any : undefined
+                this.logAction({ target: this.getObservableElCode(target), action: message, type })
+            }
+
+            this.resolve(this.formatter({ target, message })) 
+            
+            if (currentResolve === this.resolve) {
+                this.reset()
+            }
+        }   
     }
 
     resetHighlights() {
-        this.highlighted.forEach(el => el.highlight(false, true))
-        this.highlighted.clear()
+        if (this.enabled) {
+            this.highlighted.forEach(el => el.highlight(false, false, false))
+            this.highlighted.clear()
+        }
     }
 
-    highlight = (el: SelectiveElement, clickable: boolean = false, highlight: boolean= true) => {
-        if (highlight) {
-            el.highlight(true, clickable)
-        }
+    highlight = (el: SelectiveElement, config?: HighlightElementConfig) => {
+        if (this.enabled) {
+            const finalHighlightableStatus = this.highlightable && (config ? config.highlightable !== undefined ? config.highlightable : true : true)
+            const finalClickableStatus = this.clickable && (config ? config.clickable !== undefined ? config.clickable : true  : true)
+            const finalAvailableStatus = this.avaialbe && (config ? config.available !== undefined ? config.available : true  : true)
 
-        this.highlighted.add(el)
+            console.log(finalHighlightableStatus, finalClickableStatus)
+
+            if (finalClickableStatus || finalHighlightableStatus || finalAvailableStatus) {
+                el.highlight(finalHighlightableStatus, finalAvailableStatus, finalClickableStatus)
+                this.highlighted.add(el)
+            }
+        }
     }
 
     reset = () => {
-        this.resolve = (_: Command) => {}
-        this.resetHighlights()
+        if (this.enabled) {
+            this.resetHighlights()
+            this.resolve = undefined
+            this.formatter = initFormatter
+        }
     }
 
-    protected observe = (): Promise<Command> => {
-        return new Promise<Command>((res) => {
-            this.resolve = res as any
-       }).then(data => {
-            this.reset()
-            return data
-       })
-     }
+    // always need to use after highligtes
+    protected observe<D = unknown, T = unknown>(cb: (data: T) => void, formatter?: (com: Command<D>) => T, autoReturn = true) {
+        if (this.highlighted.size === 0 && autoReturn) {
+            cb(formatter ? formatter({ target: null as D, message: 'null' }) : null as T)
+        } else {
+            this.resolve = cb
+
+            if (formatter) {
+                this.formatter = formatter
+            }
+        }
+    }
 }
 
 
@@ -803,16 +992,16 @@ export class Iterator {
     }
 
     iterateThroughRound = (start: MapNode, cb: (node: MapNode) => void, clockwise: boolean = false) => {
-
         let end = clockwise ? start.next : start.prev
         this.iterateThroughLine(start, cb, end!, 'next', true)
     }
 }
 
+
 export class CardsController extends BaseController {
-    readonly leftCardsDeck: Deck = new Deck()
-    readonly handCardDeck: Deck<Card> = new Deck<Card>()
-    readonly cardsDeck: Deck = new Deck()
+    readonly left: Deck = new Deck()
+    readonly hand: Deck<Card> = new Deck<Card>()
+    readonly total: Deck = new Deck()
     canDraw: boolean = false
     private readonly maxCardsInHand: number
 
@@ -821,12 +1010,28 @@ export class CardsController extends BaseController {
         this.maxCardsInHand = maxCountInHand || 7
     }
 
+    setLeftCards = (left: Deck) => {
+        this.left.cards = left.cards
+    }
+
+    setHandCards = (hand: Deck) => {
+        this.hand.cards = hand.cards.map(mob => this.createCard(mob))
+    }
+
+    setTotalCards = (total: Deck) => {
+        this.total.cards = total.cards
+    }
+
+    getObservableElCode = (el: Card): string => {
+        return el.mobData.code
+    }
+
     addCardsToHand(count: number) {
-        if (this.handCardDeck.size < this.maxCardsInHand) {
+        if (this.hand.size < this.maxCardsInHand) {
             for (let i = 0; i < count; i++) {
-                if (this.cardsDeck.size > 0) {
-                    const takenMobData = this.cardsDeck.cards.pop()!
-                    this.handCardDeck.add(this.createCard(takenMobData))
+                if (this.total.size > 0) {
+                    const takenMobData = this.total.cards.pop()!
+                    this.hand.add(this.createCard(takenMobData))
                 } else {
                     this.updateCardsDeck()
                 }
@@ -839,99 +1044,106 @@ export class CardsController extends BaseController {
     }
 
     replenishHandDeck = () => {
-        this.addCardsToHand(this.maxCardsInHand - this.handCardDeck.size)
+        this.addCardsToHand(this.maxCardsInHand - this.hand.size)
     }
 
     updateCardsDeck() {
-        this.leftCardsDeck.cards.forEach((_,__, arr) => {
-            this.cardsDeck.add(arr.pop()!)
+        this.left.cards.forEach((_,__, arr) => {
+            this.total.add(arr.pop()!)
         });
-        this.cardsDeck.shuffle()
+        this.total.shuffle()
     }
 
     makeDraw() {
-        if (this.canDraw) {
-            this.resolve({ target: this, message: CardsActionMessages.draw })
+        if (this.canDraw && this.resolve) {
+            this.resolve({ target: this, message: LOG_ACTIONS.draw })
         }
     }
 
-    private highlightCardsSameAny = (data: any, cb: (data: any, card: MobData) => boolean, clickable?: boolean) => {
+    private highlightCardsSameAny = (data: any, cb: (data: any, card: MobData) => boolean, config?: HighlightElementConfig) => {
         this.iterateThroughHand(card => {
             if (cb(data, card.mobData)) {
-                this.highlight(card, clickable, this.enabled)
+                this.highlight(card, config)
                 card.setUsable(false)
             }
         })
     }
 
-    highlightCardsSameGuild = (guild: Guild, clickable?: boolean) => {
-        this.highlightCardsSameAny(guild, (data, c) => data === c.guild, clickable)
+    highlightCardsSameGuild = (guild: Guild, config?: HighlightElementConfig) => {
+        this.highlightCardsSameAny(guild, (data, c) => data === c.guild, config)
     }
 
-    highlightCardsByValue = (value: number, clickable?: boolean) => {
-        this.highlightCardsSameAny(value, (data, c) => data === c.value, clickable)
+    highlightCardsByValue = (value: number, config?: HighlightElementConfig) => {
+        this.highlightCardsSameAny(value, (data, c) => data === c.value, config)
     }
 
-    getCardsSameGuildAsync = (guild: Guild) => {
-        this.highlightCardsSameGuild(guild, true)
+    protected observe<D = unknown, T = unknown>(cb: (data: T) => void, formatter?: ((com: Command<D>) => T), autoReturn = true, from: Extract<keyof CardsController, 'hand' | 'total' | 'left'> = 'hand'): void {
+        super.observe<D, T>(cb, com => {
+            if (com.message !== LOG_ACTIONS.draw) {
+                this[from].remove(com.target as (Card & MobData))
+            }
 
-        return this.observe().then(data => {
-            this.handCardDeck.remove(data.target as Card)
-            return (data.target as Card).mobData
-        })
+            return formatter ? formatter(com) : com as T
+        }, autoReturn)
     }
+
+    getCardsSameGuildAsync = (guild: Guild, cb: CardWithoutResultHandler, config?: HighlightElementConfigForGetActions) => {
+        this.highlightCardsSameGuild(guild, { available: true, ...config })
+        this.observe<Card | null, MobData | null>(cb, c =>  c.target ? c.target.mobData : null)
+    }
+
+    getCardsSameValueAsync = (value: number, cb: (data: MobData | null) => void, config?: HighlightElementConfigForGetActions) => {
+        this.highlightCardsByValue(value, { available: true, ...config })
+        this.observe<Card | null, MobData | null>(cb, c =>  c.target ? c.target.mobData : null)
+     }
 
     moveCardFromHandToLeft = (data: MobData) => {
-        const found = this.handCardDeck.cards.find(card => card.mobData === data)
+        const found = this.hand.cards.find(card => card.mobData === data)
 
         if (found) {
-            this.handCardDeck.remove(found)
-            this.leftCardsDeck.add(data)
+            this.hand.remove(found)
+            this.left.add(data)
         }
     }
 
     resetHighlights = (): void => {
         this.highlighted.forEach(el => {
-            el.highlight(false, true);
+            el.highlight(false, false, false);
             (el as Card).setUsable(false)
         })
         this.highlighted.clear()
     }
 
-    getCardsSameValueAsync = (value: number) => {
-       this.highlightCardsByValue(value, true)
-
-       return this.observe().then(data => {
-            this.handCardDeck.remove(data.target as Card)
-            return (data.target as Card).mobData
-        })
-    }
-
-    highlightHand = (clickable?: boolean) => {
+    highlightHand = (config?: HighlightElementConfig) => {
         this.iterateThroughHand(card => {
-            this.highlight(card, clickable, this.enabled)
+            this.highlight(card, config)
             card.setUsable(true)
         })
     }
 
-    getSomeCardCommand = () => {
+    getSomeCardCommandAsync = (cb: (command: Command) => void, config?: HighlightElementConfigForGetActions) => {
         if (this.enabled) {
-            this.canDraw = this.handCardDeck.size < 7
+            this.canDraw = this.hand.size < 7
         }
 
-        this.highlightHand(true)
+        this.highlightHand({ available: true, ...config })
 
-        return this.observe() as Promise<Command<MobData>>
+        if (this.highlighted.size === 0) {
+            cb({ target: null as unknown, message: LOG_ACTIONS.draw  })
+        } else {
+            this.observe(cb)
+        }
     }
 
     private iterateThroughHand = (cb: (card: Card) => void) => {
-        this.handCardDeck.cards.forEach(cb)
+        this.hand.cards.forEach(cb)
     }
 
     pushCardToHand = (data: MobData) => {
-        this.handCardDeck.add(this.createCard(data))
+        this.hand.add(this.createCard(data))
     }
 }
+
 
 export class FieldsController extends BaseController {
     startNode: MapNode = new MapNode(this)
@@ -947,7 +1159,15 @@ export class FieldsController extends BaseController {
         return enemyFields[enemyFields.length - 2]
     }
 
-    getFirstElementalFieldInThisColSync = (field: Field) => {
+    getObservableElCode = (el: Field): string => {
+        return el.code
+    }
+
+    // setStartNode = (node: MapNode) => {
+    //     this.startNode = node
+    // }
+
+    getFirstEnemyElementalFieldInThisColSync = (field: Field) => {
         const enemyFields = field.parent.up?.fields!
 
         if (enemyFields.length === 1) {
@@ -957,15 +1177,29 @@ export class FieldsController extends BaseController {
         return enemyFields[0]
     }
 
-    private highlightElemental = (field: Field | null, clickable?: boolean) => {
+    calculateControllerNodesByUser = (user: User) => {
+        let countOfEmptyNodes = 0
+
+        this.iterateThroughUserNodes(node => {
+            const isControlledArea = node.up && node.up.isEmpty && !node.isEmpty
+            
+            if (isControlledArea) {
+                countOfEmptyNodes++            
+            }
+        }, user)
+
+        return countOfEmptyNodes
+    }
+
+    private highlightElemental = (field: Field | null, config?: HighlightElementConfig) => {
         if (field?.elemental) {
-            this.highlightField(field, clickable)
+            this.highlightField(field, config)
         }
     }
 
-    private highlightField = (field: Field | null, clickable?: boolean) => {
+    private highlightField = (field: Field | null, config?: HighlightElementConfig) => {
         if (field) {
-            this.highlight(field, clickable, this.enabled)
+            this.highlight(field, config)
         }
     }
 
@@ -991,80 +1225,119 @@ export class FieldsController extends BaseController {
         return this.getNeighBoors(field.parent)
     }
 
-    highlightNeighBoorEnemyFirstElemental = (field: Field, clickable?: boolean) => {
+    highlightNeighBoorEnemyFirstElemental = (field: Field, config?: HighlightElementConfig) => {
         this
             .getEnemyNeighBoors(field)
             .forEach(node => 
-                this.highlightElemental(this.getFirstElementalInNode(node), clickable)
+                this.highlightElemental(this.getFirstFieldWithElementalInNode(node), config)
             )
     }
 
-    getNeighBoorEnemyFirstElementalAsync = (field: Field) => {
-        this.highlightNeighBoorEnemyFirstElemental(field, true)
-
-        return this.formattedObserve()
+    getNeighBoorEnemyFirstElementalAsync = (field: Field, cb: FieldHandlerWithNoResult, config?: HighlightElementConfigForGetActions) => {
+        this.highlightNeighBoorEnemyFirstElemental(field, { available: true, ...config })
+        this.formattedObserve(cb)
     }
 
-    private formattedObserve = () => {
-        if (this.highlighted.values.length === 0) {
-            return Promise.resolve(null)
-        }
-
-        return this.observe().then(data => data.target as Field)
+    private formattedObserve = (cb: FieldHandler, autoReturn: boolean = true) => {
+        if (this.highlighted.size === 1 && autoReturn) {
+            this.highlighted.forEach((field) => {
+                cb(field as Field)
+            })
+            this.reset()
+        } else {
+            this.observe<Field, Field>(cb, c => c!.target)
+        }       
     }
 
     getAllNeighBoorEnemyFirstElementalsSync = (field: Field) => {
-       return this.getEnemyNeighBoors(field).map(this.getFirstElementalInNode).filter(f => f) as Field[]
+       return this.getEnemyNeighBoors(field).map(this.getFirstFieldWithElementalInNode).filter(f => f) as Field[]
     }
 
     transferElementalToNewField = (from: Field, to: Field) => {
         if (from.elemental && !to.elemental) {
             to.elemental = from.elemental
+            to.parent.addField()
             from.delete()
         }
     }
 
-    iterateThroughMyNodes = (cb: (node: MapNode) => void) => {
+    iterateThroughUserNodes = (cb: (node: MapNode) => void, user: User) => {
         if (this.startNode.next) {
-            this.iterator.iterateThroughLine(this.startNode.next, cb, undefined, 'next', false)
+            this.iterator.iterateThroughRound(this.startNode.next, node => {
+                if (node.user && node.user[0] === user) {
+                    cb(node)
+                }
+            })
         }
     }
 
-    highlightMyElementalsByAny = (data: MobData, isEqual: (el: Elemental, data: MobData) => boolean, exceptions: Field[], clickable?: boolean) => {
-        this.iterateThroughMyNodes(node => {
-            node.fields.forEach(field => {
-                if (field.elemental && isEqual(field.elemental, data) && !exceptions.includes(field)) {
-                    this.highlightElemental(field, clickable)
+    iterateThroughTeamNodes = (cb: (node: MapNode) => void, team: Team) => {
+        if (this.startNode.next) {
+            this.iterator.iterateThroughRound(this.startNode.next, node => {
+                if (node.user && node.user[1] === team) {
+                    cb(node)
                 }
             })
-        })
+        }
     }
 
-    highLightMyElementalsByGuild = (data: MobData, exceptions: Field[], clickable?: boolean) => {
-        this.highlightMyElementalsByAny(data, (el, data) => el.guild === data.guild, exceptions, clickable)
+    private highlightSomeElementalsInNode = (data: MobData, exceptions: Field[], isEqual: EqualFunction, config?: HighlightElementConfig) => (node: MapNode) => {
+            node.fields.forEach(field => {
+                if (field.elemental && isEqual(field.elemental, data) && !exceptions.includes(field)) {
+                    this.highlightElemental(field, config)
+                }
+            })
     }
 
-    highlightMyElementalsByValue = (data: MobData, exceptions: Field[], clickable?: boolean) => {
-        this.highlightMyElementalsByAny(data, (el, data) => el.maxHealth === data.value, exceptions, clickable)
+    highlightTeamElementalsByAny = (team: Team ,data: MobData, isEqual: (el: Elemental, data: MobData) => boolean, exceptions: Field[], config?: HighlightElementConfig) => {
+        this.iterateThroughTeamNodes(this.highlightSomeElementalsInNode(data, exceptions, isEqual, config), team)
     }
 
-    getMyElementalsByValueAsync = (data: MobData, exceptions: Field[]) => {
-        this.highlightMyElementalsByValue(data, exceptions, true)
-
-        return this.formattedObserve()
+    highlightUserElementalsByAny = (user: User ,data: MobData, isEqual: (el: Elemental, data: MobData) => boolean, exceptions: Field[], config?: HighlightElementConfig) => {
+        this.iterateThroughUserNodes(this.highlightSomeElementalsInNode(data, exceptions, isEqual, config), user)
     }
 
-    getMyElementalByGuildAsync = (data: MobData, exceptions: Field[]) => {
-        this.highLightMyElementalsByGuild(data, exceptions, true)
+    highLightTeamElementalsByGuild = (team: Team, data: MobData, exceptions: Field[], config?: HighlightElementConfig) => {
+        this.highlightTeamElementalsByAny(team, data, (el, data) => el.guild === data.guild, exceptions, config)
+    }
 
-        return this.formattedObserve()
+    highlightTeamElementalsByValue = (team: Team, data: MobData, exceptions: Field[], config?: HighlightElementConfig) => {
+        this.highlightTeamElementalsByAny(team, data, (el, data) => el.maxHealth === data.value, exceptions, config)
+    }
+
+    highLightUserElementalsByGuild = (user: User, data: MobData, exceptions: Field[], config?: HighlightElementConfig) => {
+        this.highlightUserElementalsByAny(user, data, (el, data) => el.guild === data.guild, exceptions, config)
+    }
+
+    highlightUserElementalsByValue = (user: User, data: MobData, exceptions: Field[], config?: HighlightElementConfig) => {
+        this.highlightUserElementalsByAny(user, data, (el, data) => el.maxHealth === data.value, exceptions, config)
+    }  
+
+    getTeamElementalsByValueAsync = (team: Team, data: MobData, exceptions: Field[], cb: FieldHandlerWithNoResult, config?: HighlightElementConfigForGetActions & { autoReturn?: boolean }) => {
+        this.highlightTeamElementalsByValue(team, data, exceptions, { available: true, ...config })
+        this.formattedObserve(cb, !!config?.autoReturn)
+    }
+
+    getUserElementalsByValueAsync = (user: User, data: MobData, exceptions: Field[], cb: FieldHandlerWithNoResult, config?: HighlightElementConfigForGetActions & { autoReturn?: boolean }) => {
+        this.highlightUserElementalsByValue(user, data, exceptions, { available: true, ...config })
+        this.formattedObserve(cb, !!config?.autoReturn)
+    }
+
+    getTeamElementalByGuildAsync = (team: Team, data: MobData, exceptions: Field[], cb: FieldHandlerWithNoResult, config?: HighlightElementConfigForGetActions & { autoReturn?: boolean }) => {
+        this.highLightTeamElementalsByGuild(team, data, exceptions, { available: true, ...config })
+        this.formattedObserve(cb, !!config?.autoReturn)
+    }
+
+    getUserElementalByGuildAsync = (user: User, data: MobData, exceptions: Field[], cb: FieldHandlerWithNoResult, config?: HighlightElementConfigForGetActions & { autoReturn?: boolean }) => {
+        this.highLightUserElementalsByGuild(user, data, exceptions, { available: true, ...config })
+        this.formattedObserve(cb, !!config?.autoReturn)
     }
 
     getLastFieldInNode = (node: MapNode) => {
         return node.fields[node.fields.length - 1]
     }
 
-    getFirstElementalInNode = (node: MapNode) => {
+    getFirstFieldWithElementalInNode = (node: MapNode) => {
         if (node.fields.length === 1) {
             return null
         }
@@ -1072,41 +1345,43 @@ export class FieldsController extends BaseController {
         return node.fields[0]
     }
 
-    private getFirstFieldInNode = (node: MapNode) => {
-        return node.fields[0]
-    }
-
-    // private getLastElementalInNode = (node: MapNode) => {
-    //     if (node.fields.length > 1) {
-    //         return node.fields[node.fields.length - 2]
-    //     }
-
-    //     return null
+    // private getFirstFieldInNode = (node: MapNode) => {
+    //     return node.fields[0]
     // }
 
-    highlightMyAnyLastEmptyField = (field?: Field, clickable?: boolean) => {
-        this.iterateThroughMyNodes(node => {
-            if (field ? node !== field.parent : true) {
-                this.highlightField(this.getLastFieldInNode(node), clickable)
-            }
-        })
+    private highlightEmptyFieldHandler = (nodesExceptions: MapNode[], config?: HighlightElementConfig) => (node: MapNode) => {
+        if (!nodesExceptions.includes(node)) {
+            this.highlightField(this.getLastFieldInNode(node), config)
+        }
     }
 
-    getMyAnyLastEmptyFieldAsync = (field?: Field) => {
-       this.highlightMyAnyLastEmptyField(field, true)
-
-        return this.formattedObserve()
+    highlightTeamAnyLastEmptyField = (team: Team, nodesExceptions: MapNode[], config?: HighlightElementConfig) => {
+        this.iterateThroughTeamNodes(this.highlightEmptyFieldHandler(nodesExceptions, config), team)
     }
+
+    highlightUserAnyLastEmptyField = (user: User, nodesExceptions: MapNode[], config?: HighlightElementConfig) => {
+        this.iterateThroughUserNodes(this.highlightEmptyFieldHandler(nodesExceptions, config), user)
+    }
+
+    getTeamAnyLastEmptyFieldAsync = (team: Team, nodesExceptions: MapNode[], cb: FieldHandler, config?: HighlightElementConfigForGetActions) => {
+       this.highlightTeamAnyLastEmptyField(team, nodesExceptions, { available: true, ...config })
+       this.formattedObserve(cb)
+    }
+
+    getUserAnyLastEmptyFieldAsync = (user: User, nodesExceptions: MapNode[], cb: FieldHandler, config?: HighlightElementConfigForGetActions) => {
+        this.highlightUserAnyLastEmptyField(user, nodesExceptions, { available: true, ...config })
+        this.formattedObserve(cb)
+     }
 
     getEnemyFirstElementalsInThreeColsSync = (field: Field) => {
         const fields: (Field | null)[] = []
 
         const addFields = (node: MapNode) => {
-            fields.push(this.getFirstElementalInNode(node))
+            fields.push(this.getFirstFieldWithElementalInNode(node))
         }
 
-        addFields(field.parent)
-        this.getNeighBoors(field.parent).forEach(addFields)
+        addFields(field.parent.up!)
+        this.getNeighBoors(field.parent.up!).forEach(addFields)
 
         return fields.filter(field => field) as Field[]
     }
@@ -1125,88 +1400,92 @@ export class FieldsController extends BaseController {
         return fields 
     }
 
-    getFieldsBeforeSync = (field: Field) => {
+    getFieldsWithElementalBeforeSync = (field: Field) => {
         return this.getBeforeAfterElementalsSync(field, 'prev')
     }
 
-    getFieldAfterSync = (field: Field) => {
+    getFieldsWithElementalAfterSync = (field: Field) => {
         return this.getBeforeAfterElementalsSync(field, 'next')
     }
 
-    getMyNeighBoorLastEmptyFieldAsync = (field: Field | Field[]) => {
-        this.highlightNeighBoorFields(field, true)
-
-        return this.formattedObserve()
+    getNeighBoorLastEmptyFieldAsync = (field: Field | Field[], cb: FieldHandler, config?: HighlightElementConfigForGetActions) => {
+        this.highlightNeighBoorLastEmptyFields(field, { available: true, ...config })
+        this.formattedObserve(cb)
     }
 
-    highlightNeighBoorFields = (field: Field | Field[], clickable?: boolean) => {
+    highlightNeighBoorLastEmptyFields = (field: Field | Field[], config?: HighlightElementConfig) => {
         if (Array.isArray(field)) {
             const highlightNeighBoor = (node: MapNode | null) => {
                 if (node) {
-                    this.highlightField(this.getFirstFieldInNode(node), clickable)
+                    this.highlightField(this.getLastFieldInNode(node), config)
                 }
             }
         
             highlightNeighBoor(field[0].parent.prev)
             highlightNeighBoor(field[field.length - 1].parent.next)
         } else {
-            this.getMyNeighBoors(field).forEach(node => this.highlightField(this.getLastFieldInNode(node), clickable))
+            this.getMyNeighBoors(field).forEach(node => this.highlightField(this.getLastFieldInNode(node), config))
         }
     }
 
-    highlightLastFieldInNode = (field: Field, clickable?: boolean) => {
-        this.highlightField(this.getLastFieldInNode(field.parent), clickable)
+    highlightLastFieldInNode = (field: Field, config?: HighlightElementConfig) => {
+        this.highlightField(this.getLastFieldInNode(field.parent), config)
     }
 
-    getLastNeighBoorsAndCurrentAsync = (field: Field) => {
-        this.highlightLastFieldInNode(field, true)
-        this.highlightNeighBoorFields(field, true)
-
-        return this.formattedObserve()
+    getLastNeighBoorsAndCurrentEmptyFieldAsync = (field: Field, cb: FieldHandler, config?: HighlightElementConfigForGetActions) => {
+        this.highlightLastFieldInNode(field, { available: true, ...config })
+        this.highlightNeighBoorLastEmptyFields(field, { available: true, ...config })
+        this.formattedObserve(cb)
     }
 
-    getMyLastFieldInThisNodeAsync = (field: Field) => {
-        this.highlightLastFieldInNode(field, true)
-
-        return this.formattedObserve()
+    getLastFieldInThisNodeAsync = (field: Field, cb: FieldHandler, config?: HighlightElementConfigForGetActions) => {
+        this.highlightLastFieldInNode(field, { available: true, ...config })
+        this.formattedObserve(cb)
     }
 
-    highlightMyAnyElementalInThisNode = (field: Field, clickable?: boolean) => {
-        field.parent.fields.forEach(field => field !== field && this.highlightElemental(field, clickable))
+    highlightAnyElementalInThisNode = (field: Field, config?: HighlightElementConfig) => {
+        field.parent.fields.forEach(f => f !== field && this.highlightElemental(f, config))
     }
 
-    highlightEnemyAnyElementalInThisNode = (field: Field, clickable?: boolean) => {
-        field.parent.up!.fields.forEach(f => this.highlightElemental(f, clickable))
+    highlightEnemyAnyElementalInThisNode = (field: Field, config?: HighlightElementConfig) => {
+        field.parent.up!.fields.forEach(f => this.highlightElemental(f, config))
      }
 
-     getEnemyAnElementalInThisNode = (field: Field) => {
-        this.highlightEnemyAnyElementalInThisNode(field, true)
-
-        return this.formattedObserve()
+    getEnemyAnyElementalInThisNodeAsync = (field: Field, cb: FieldHandlerWithNoResult, config?: HighlightElementConfigForGetActions) => {
+        this.highlightEnemyAnyElementalInThisNode(field, { available: true, ...config })
+        this.formattedObserve(cb)
      }
 
-    getMyAnyElementalInThisNodeAsync = (field: Field) => {
-       this.highlightMyAnyElementalInThisNode(field, true)
-
-        return this.formattedObserve()
+    getAnyElementalInThisNodeAsync = (field: Field, cb: FieldHandlerWithNoResult, highlightable?: boolean) => {
+       this.highlightAnyElementalInThisNode(field, { clickable: true, highlightable })
+       this.formattedObserve(cb)
     }
 
-    highlightMyAnyElemental = (field?: Field, clickable?: boolean) => {
-        if (this.startNode.next) {
-            this.iterateThroughMyNodes(node => {
-                node.fields.forEach(f => f !== field && this.highlightElemental(f, clickable))
-            })
-        }
+    private highlighAnyElementalHandler = (exceptions: Field[], config?: HighlightElementConfig) => (node: MapNode) => {
+        node.fields.forEach(f => !exceptions.includes(f) && this.highlightElemental(f, config))
+    }
+    
+    highlightTeamAnyElemental = (team: Team, exception: Field[], config?: HighlightElementConfig) => {
+       this.iterateThroughTeamNodes(this.highlighAnyElementalHandler(exception, config), team)
     }
 
-    getMyAnyElementalAsync = (field?: Field) => {
-        this.highlightMyAnyElemental(field, true)
+    highlightUserAnyElemental = (user: User, exception: Field[], config?: HighlightElementConfig) => {
+        this.iterateThroughUserNodes(this.highlighAnyElementalHandler(exception, config), user)
+     }
 
-        return this.formattedObserve()
+    getTeamAnyElementalAsync = (team: Team, exceptions: Field[], cb: FieldHandlerWithNoResult, config?: HighlightElementConfigForGetActions) => {
+        this.highlightTeamAnyElemental(team, exceptions, { available: true, ...config })
+        this.formattedObserve(cb)
     }
 
-    getConcreteFieldAsync = (code: string) => {
-        this.resolve({ target: this.getConcreteFieldSync(code), message: 'GET' })
+    getUserAnyElementalAsync = (user: User, exceptions: Field[], cb: FieldHandlerWithNoResult, config?: HighlightElementConfigForGetActions) => {
+        this.highlightUserAnyElemental(user, exceptions, { available: true, ...config })
+        this.formattedObserve(cb)
+    }
+
+    getConcreteFieldAsync = (code: string, cb: FieldHandlerWithNoResult) => {
+        const found = this.getConcreteFieldSync(code)
+        cb(found)
     }
 
     iterateThroughAllNodes = (cb: (node: MapNode) => void) => {
@@ -1218,13 +1497,22 @@ export class FieldsController extends BaseController {
     }
 
     getConcreteFieldSync = (code: string): Field | null => {
-        const [userId, index] = code.split('_')
+        const [userId, index, guildCode, value, mobIndex] = code.split('_')
         let selectedField = null
 
         if (this.startNode.next) {
             this.iterator.iterateThroughLine(this.startNode.next, node => {
                 if (node.user && node.user[0].id === userId && node.index === +index) {
-                    selectedField = node.fields.find(field => field.code === code)
+                    if (guildCode !== undefined && value !== undefined && mobIndex !== undefined) {
+                        selectedField = node.fields.find(field => {
+                            if (field.elemental) {
+                                return field.elemental.mobData.code === MobData.parseCode(guildCode as GuildCode, +value, +mobIndex)
+                            }
+                            return false
+                        })
+                    } else {
+                        selectedField = node.lastField
+                    }
                 }
             }, this.startNode, 'next', true)
         }
@@ -1232,18 +1520,154 @@ export class FieldsController extends BaseController {
         return selectedField
     }
 
-    getMyNodesInArray = () => {
-        const arr: MapNode[] = []
-        this.iterator.iterateThroughLine(this.startNode, node => arr.push(node))
+    getTeamFieldsInArray = (team: Team) => {
+        const arr: Field[][] = []
+        this.iterateThroughTeamNodes(node => arr.push(node.fields), team)
+        return arr
+    }
 
+    getEnemyFieldsForTeamInArray = (team: Team) => {
+        const arr: Field[][] = []
+        this.iterateThroughTeamNodes(node => arr.push(node.up!.fields), team)
+        return arr
+    }
+
+    getEnemyFieldsForUserInArray = (user: User) => {
+        const arr: Field[][] = []
+        this.iterateThroughUserNodes(node => arr.push(node.up!.fields), user)
+        return arr
+    }
+
+    getUserFieldsInArray = (user: User) => {
+        const arr: Field[][] = []
+        this.iterateThroughUserNodes(node => arr.push(node.fields), user)
         return arr
     }
 }
 
-export type Decks = {
-    hand: string[]
-    left: string[]
-    deck: string[]
+abstract class InGameStageUpdater<T extends InGameStage> {
+    stage: T
+
+    constructor(stage: T) {
+        this.stage = stage
+    }
+
+    abstract updateAllState(state: Pick<ServerGameState, 'teams' | 'guilds' | 'logs'>): void
+}
+
+
+
+export class GameRoomUpdater {
+    stage: GameRoom
+
+    constructor (stage: GameRoom) {
+        this.stage = stage
+    }
+
+    updateOwner = ({ owner }: ServerFinalState) => {
+        const user = this.stage.teams.map(team => team.users).flat().find(user => user.id === owner)
+       
+        if (user) {
+            this.stage.owner = user
+        }
+    }
+
+    updateTeams = ({ teams }: ServerFinalState) => {
+        this.stage.teams = teams.map(RoomTeamMapper.toDomain)
+    }
+
+    updateName = ({ roomState: { name } }: ServerFinalState) => {
+        this.stage.props.name = name
+    }
+
+    updateProps = ({ roomState: { props, password, type, name }}: ServerFinalState) => {
+        this.stage.props.setData({ ...props, type, password, name })
+    }
+}
+
+export class GameProcessUpdater extends InGameStageUpdater<GameProcess> {
+
+    updateTeamPoints = (data: ServerTeamPoints[]) => {
+        data.forEach(({ id, points }) => {
+            this.stage.points.setPointByTeamId(id, points)
+        })
+    }
+
+    updateUserDecks = (data: ServerUserCards[]) => {
+        this.stage.usersCards.forEach((controller, user) => {
+            const userData = data.find(u => u.id === user.id)
+
+            if (userData) {
+                const { left, hand, deck } = userData.cards
+
+                controller.setHandCards(DeckMapper.toDomain(hand))
+                controller.setLeftCards(DeckMapper.toDomain(left))
+                controller.setTotalCards(DeckMapper.toDomain(deck))
+            }
+        })
+    }
+
+    updateGameField = (data: ServerUserFields[]) => {
+        this.stage.gameField.iterateThroughAllNodes(node => {
+            if (node.user) {
+                const user = node.user[0]
+
+                const userFeilds = data.find(({ id }) => user.id === id)
+
+                if (userFeilds) {
+                    const fields = userFeilds.fields[node.index]
+
+                    if (fields) {
+                        node.setFields([])
+                        node.addField()
+                        fields.forEach(field => {
+                                node
+                                    .lastField!
+                                    .setElemental(ElementalMapper.toDomain(field))
+                                node.addField()
+                            })
+                    }
+                }
+            }
+        })
+    }
+
+    updateAllState = (state: GameProcessUpdateAllStatePayload) => {
+        const usersState = state.teams.map(team => team.users).flat()
+        this.updateGameField(usersState)
+        this.updateUserDecks(usersState)
+        this.updateTeamPoints(state.teams)
+    }
+}
+
+
+
+
+export class DraftUpdater extends InGameStageUpdater<Draft> {
+
+    private getGuilds = (guilds: GuildCode[]) => GuildFactory.getInstance().createSeveral(guilds)
+
+    updateGuildsPool = (data: ServerGameState['guilds']) => {
+        this.stage.guilds.setGuilds(this.getGuilds(data))
+    }
+
+    updateUserGuilds = (data: ServerUserDrafts[]) => {
+        this.stage.usersDraft.forEach((draft, user) => {
+            const userPicks = data.find(d => d.id === user.id)
+
+            if (userPicks) {
+                const { draft: { picks, bans } } = userPicks
+
+                draft.setChosen(this.getGuilds(picks))
+                draft.setBanned(this.getGuilds(bans))
+            }
+        })
+    }
+
+    updateAllState = (state: DraftUpdateAllStatePayload) => {
+        this.updateUserGuilds(state.teams.map(team => team.users).flat())
+        this.updateGuildsPool(state.guilds)
+    }
 }
 
 export class GameContentBuilder {
@@ -1255,40 +1679,15 @@ export class GameContentBuilder {
         this.users = users
     }
 
-    private createMob = (code: GuildCode, value: number): MobData => {
-        return new MobData(GuildFactory.getInstance().create(code), value)
-    }
-
     setGameFields = (controller: FieldsController) => {
         this.gameField = controller
     }
 
-    private parseDeck = (decks: Decks) => {
-        const controller = new CardsController()
-
-        decks.deck.forEach(c => {
-            const [code, value] = c.split('_')
-            controller.cardsDeck.add(this.createMob(code as GuildCode, +value))
-        })
-
-        decks.left.forEach(c => {
-            const [code, value] = c.split('_')
-            controller.leftCardsDeck.add(this.createMob(code as GuildCode, +value))
-        })
-
-        decks.hand.forEach(c => {
-            const [code, value] = c.split('_')
-            controller.pushCardToHand(this.createMob(code as GuildCode, +value))
-        })
-        
-        return controller
-    }
-
-    parseUserDecks = (decs: Map<User, Decks>) => {
+    parseUserDecks = (decs: Map<User, ServerUserDecks>) => {
         this.userCards = new Map<User, CardsController>()
 
         for (let entry of decs.entries()) {
-            this.userCards.set(entry[0], this.parseDeck(entry[1]))
+            this.userCards.set(entry[0], CardsControllerMapper.toDomain(entry[1]))
         }
 
         return this
@@ -1312,12 +1711,12 @@ export class GameContentBuilder {
                     const count = VALUE_COUNT[+key as keyof typeof VALUE_COUNT]
             
                     for (let i = 0; i < count; i++) {
-                        controller.cardsDeck.add(new MobData(guild, value))
+                        controller.total.add(new MobData(guild, value, i))
                     }
                 })
             })
 
-            controller.cardsDeck.shuffle()
+            controller.total.shuffle()
             controller.replenishHandDeck()
 
             this.userCards.set(user, controller)
@@ -1334,7 +1733,10 @@ export class GameContentBuilder {
 
             this.gameField.iterateThroughAllNodes(node => {
                 if (node.user && node.user[0] === singlePlayer && [1, 4].includes(node.index)) {
-                    node.fields[0].createElemental(this.userCards.get(singlePlayer)!.cardsDeck.cards.pop()! )
+                    const userCards = this.userCards.get(singlePlayer)!.total.cards
+                    if (userCards.length > 0) {
+                        node.fields[0].createElemental(userCards.pop()! )
+                    }  
                 }
             })
         } else {
@@ -1342,7 +1744,11 @@ export class GameContentBuilder {
 
             this.gameField.iterateThroughAllNodes(node => {
                 if (node.user && node.user[0] === firstPlayer && node.index === (playersCount === 4 ? 1 : 2 )) {
-                    node.fields[0].createElemental(this.userCards.get(firstPlayer)!.cardsDeck.cards.pop()! )
+                    const userCards = this.userCards.get(firstPlayer)!.total.cards
+                    if (userCards.length > 0) {
+                        node.fields[0].createElemental(userCards.pop()! )
+                    }
+                   
                 }
             })
         }
@@ -1350,26 +1756,7 @@ export class GameContentBuilder {
         return this
     }
 
-    parseUserFields = (usersFields: Map<User, string[][]>) => {
-        this.gameField.iterateThroughAllNodes(node => {
-            if (node.user) {
-                const user = node.user[0]
-                node.setFields([])
-                node.addField()
-
-                usersFields.get(user)![node.index]?.forEach(field => {
-                    const [guild, value, health] = field.split('_')
-                    node
-                    .lastField!
-                    .createElemental(this.createMob(guild as GuildCode, +value), +health)
-                })
-            }
-        })
-
-        return this
-    }
-
-    createGameField = (usersFields?: Map<User, string[][]>) => {
+    createGameField = (usersFields?: Map<User, ElementalCode[][]>) => {
         const groups = this.users.groupedTeamsInRightOrder
         const countOfPlayers = this.users.playersCount
 
@@ -1400,12 +1787,12 @@ export class GameContentBuilder {
                         lastNode = lastNode.createNextNode(user, i)
                         
                         if (usersFields) {
-                            usersFields.get(user[0])![i]?.forEach(field => {
-                                const [guild, value, health] = field.split('_')
-                             
+                            usersFields.get(user[0])![i]?.forEach(field => {                         
                                 lastNode
                                     .lastField!
-                                    .createElemental(this.createMob(guild as GuildCode, +value), +health)
+                                    .setElemental(ElementalMapper.toDomain(field))
+
+                                lastNode.addField()
                             })
                         }
                     }
@@ -1427,7 +1814,7 @@ export class GameContentBuilder {
             for (let i = 0; i < maxCountOfFieldsForGroup; i++ ) {
                 up = up.prev!
                 down = down.next!
-                up.down = down
+                up.up = down
                 down.up = up
             }
         }
@@ -1486,19 +1873,29 @@ export class GuildsPoolController extends BaseController {
     
     }
 
-    takeRandomGuildAsync = () => {
-        this.resolve({ target: this.takeRandomGuildCard(), message: 'random_guild' })
+    getObservableElCode = (el: GuildCard): string => {
+        return el.guild.code
     }
 
-    private takeRandomGuildCard = () => {
-        const guildCard = this.guilds[Math.floor(Math.random() * (this.guilds.length - 1))]!
-        this.deleteGuildCard(guildCard)
+    takeRandomGuildAsync = () => {
+        if (this.resolve) {
+            this.resolve(this.takeRandomGuild())
+        }
+    }
 
-        return guildCard
+    private takeRandomGuild = () => {
+        if (this.guilds.length > 0) {
+            const guildCard = getRandomElement(this.guilds) as GuildCard
+            this.deleteGuildCard(guildCard)
+    
+            return guildCard.guild
+        }
+
+        return null
     }
 
     takeRandomGuildSync() {
-        return this.takeRandomGuildCard().guild
+        return this.takeRandomGuild()
     }
 
     setGuildsCards = (cards: GuildCard[]) => {
@@ -1513,29 +1910,28 @@ export class GuildsPoolController extends BaseController {
         this.setGuildsCards(guilds.map(g => new GuildCard(g, this)))
     }
 
-    private formattedObserve = () => {
-        return this.observe().then(data => {
-            this.deleteGuildCard(data.target as GuildCard)
-
-            return (data.target as GuildCard).guild
-        })
+    highlightGuilds = (config?: HighlightElementConfig) => {
+        this.guilds.forEach(card => this.highlight(card, config))
     }
 
-    highlightGuilds = (clickable?: boolean) => {
-        this.guilds.forEach(card => this.highlight(card, clickable))
+    getGuildAsync = (cb: (g: Guild) => void, config?: HighlightElementConfigForGetActions) => {
+        if (this.enabled) {
+            this.canRandom = true
+            this.highlightGuilds({ available: true, ...config })
+            this.observe<GuildCard, Guild>(cb, c => {
+                const card = c.target
+                this.deleteGuildCard(c.target)
+                return card.guild
+            })
+        }
     }
 
-    getGuildAsync = () => {
-        this.canRandom = true
-        this.highlightGuilds(true)
-
-        return this.formattedObserve()
-    }
-
-    getConcreteGuild = (code: string) => {
-        const guild = this.guilds.find(card => card.guild.code === code)
-
-        this.resolve({ target: guild, message: 'concrete_guild' })
+    getConcreteGuildAsync = (code: GuildCode) => {
+        if (this.resolve) {
+            const guild = this.guilds.find(card => card.guild.code === code)
+            guild && this.deleteGuildCard(guild)
+            this.resolve(guild ? guild.guild : null)
+        } 
     }
 
     resetHighlights = () => {
@@ -1551,57 +1947,64 @@ export class GuildCard extends SelectiveElement {
         super(mediator)
         this.guild = guild
     }
+
+    select = () => this.interact(LOG_ACTIONS.select_guild)
 }
 
-export type UserPicks = {
-    bans: GuildCode[]
-    picks: GuildCode[]
-}
 
-abstract class Stage {
-    readonly code: GameStageCode
-    protected stageController: GameStageController
-
-    constructor (code: GameStageCode, controller: GameStageController) {
-        this.code = code
-        this.stageController = controller
-    }
-
-    setGameStageController = (controller: GameStageController) => {
-        this.stageController = controller
-    }
-
-    abstract stop(): void
-    abstract start(): void
-}
-
-export class Team {
+export class Team<T extends User = User> {
     readonly id: string
     readonly name: string | undefined
-    users: User[] = []
+    users: T[] = []
 
-    constructor(id: string, users: User[], name?: string) {
+    constructor(id: string, users: T[], name?: string) {
         this.id = id
         this.name = name
         this.users = users
+        makeAutoObservable(this)
     }
 
-    addUser = (u: User) => {
-        this.users.push(u)
+    addUser = (u: T) => {
+        if (!this.hasUser(u)) {
+            this.users.push(u)
+        }
     }
 
-    removeUser = (u: User) => {
+    get playersCount () {
+        return this.users.length
+    }
+
+    findUserById = (id: string) => {
+        return this.users.find(user => user.id === id) || null
+    }
+
+    hasUser = (user: User) => {
+        return this.users.some(u => u.id === user.id)
+    }
+
+    hasUserById = (id: string) => {
+        return this.users.some(u => u.id === id)
+    }
+
+    removeUserById = (id: string) => {
+        this.users = this.users.filter(user => user.id !== id)
+    }
+
+    removeUser = (u: T) => {
         this.users = this.users.filter(user => user !== u)
     }
 }
 
-abstract class UsersStorage {
+export class UsersStorage {
     readonly teams: Team[] = []
     readonly currentUser: User | null = null
+    isViewer: boolean = false
 
     constructor(teams: Team[], currentUser?: User | null) {
         this.teams = teams
         this.currentUser = currentUser || this.currentUser
+        this.isViewer = !teams.some(team => team.users.some(u => u.id === this.currentUser?.id))
+        
         makeObservable(this, {
             playersCount: computed,
             groupedTeamsInRightOrder: computed
@@ -1609,11 +2012,11 @@ abstract class UsersStorage {
     }
 
     get playersCount () {
-        return this.teams.reduce((acc, t) => acc + t.users.length, 0)
+        return this.teams.reduce((acc, t) => acc + t.playersCount, 0)
     }
 
     get groupedTeamsInRightOrder() {
-        const foundTeam = this.currentUser ? this.teams.find(team => team.users.includes(this.currentUser!)) : undefined
+        const foundTeam = this.currentUser ? this.teams.find(team => team.hasUser(this.currentUser!)) : undefined
         const currentTeam = foundTeam || this.teams[0]
         const currentTeamIndex = this.teams.indexOf(currentTeam)
         const currentUserIndex = foundTeam ? currentTeam.users.indexOf(this.currentUser!) : 0
@@ -1644,13 +2047,19 @@ abstract class UsersStorage {
 
 }
 
+
+
 export class Turn extends UsersStorage {
     readonly usersOrder: UserTuple[]
     currentTurnIndex: number = 0 
     private firstTurnIndex: number = 0
+    isGuest: boolean = false
+    private logActionFunction: LogAction | undefined
+    private nextTurnSideEffect: NextTurnSideEffect | undefined
 
-    constructor(teams: Team[], currentUser?: User | null, firstTurn?: User) {
+    constructor(teams: Team[], currentUser?: User | null, firstTurn?: User, logActionFunction?: LogAction) {
         super(teams, currentUser)
+        this.logActionFunction = logActionFunction
         makeObservable(this, {
             currentTurnIndex: observable,
             setTurn: action,
@@ -1662,7 +2071,7 @@ export class Turn extends UsersStorage {
             isMyTurn: computed
         })
 
-        const maxCountOfUserPerTeam = this.teams.reduce((acc, team) => Math.max(acc, team.users.length) ,0)
+        const maxCountOfUserPerTeam = this.teams.reduce((acc, team) => Math.max(acc, team.playersCount) ,0)
         this.usersOrder = []
 
         for (let i = 0; i < maxCountOfUserPerTeam; i++) {
@@ -1677,6 +2086,22 @@ export class Turn extends UsersStorage {
         const newIndex = userIndex ?? Math.floor(Math.random() * (this.playersCount - 1))
         this.currentTurnIndex = newIndex
         this.firstTurnIndex = newIndex
+        this.isGuest = currentUser
+            ? this.usersOrder.some(([user]) => user.id === currentUser.id)
+            : true
+    }
+
+    setNextTurnSideEffect = (sideEffect: NextTurnSideEffect) => {
+        this.nextTurnSideEffect = sideEffect
+    }
+
+    getUserById = (id: string) => {
+        const tupple = this.usersOrder.find(([user]) => user.id === id)
+        return tupple ? tupple[0] : null
+    }
+
+    private logAction = (log: LogPayload) => {
+        this.logActionFunction && this.logActionFunction(log)
     }
 
     get firstTurnUser () {
@@ -1704,10 +2129,16 @@ export class Turn extends UsersStorage {
         }
     }
 
-    next() {
+    next(sideEffect?: NextTurnSideEffect) {
         this.currentTurnIndex = this.currentTurnIndex === this.usersOrder.length - 1
             ? 0
             : this.currentTurnIndex + 1
+
+        this.logAction({ action: LOG_ACTIONS.switch_turn, target: this.currentTurn.id, type: "extra" })
+
+        sideEffect
+            ? sideEffect(this.currentTurn) 
+            : this.nextTurnSideEffect && this.nextTurnSideEffect(this.currentTurn)
     }
 
     get isMyTurn() {
@@ -1762,6 +2193,18 @@ export class PointsManager {
         this.points.set(team, this.points.get(team)! + value)
     }
     
+    setPoint = (team: Team, value: number) => {
+        this.points.set(team, value)
+    }
+
+    setPointByTeamId = (id: string, value: number) => {
+        const userTouple = this.turn.usersOrder.find(([, team]) => team.id === id)
+
+        if (userTouple && userTouple[1]) {
+            this.setPoint(userTouple[1], value)
+        }
+    }
+    
     get isEndOfTheGame () {
         let max = 0
         
@@ -1773,28 +2216,62 @@ export class PointsManager {
     }
 }
 
-export type UsersCards = Map<User, CardsController>
+
 
 export class Killer {
     private readonly points: PointsManager 
     private readonly usersCards: UsersCards
+    private logActionFunction: LogAction | undefined
 
-    constructor (userCards: UsersCards, points: PointsManager) {
+    constructor (userCards: UsersCards, points: PointsManager, logActionFunction?: LogAction) {
         this.usersCards = userCards
         this.points = points
+        this.logActionFunction = logActionFunction
+    }
+
+    setLogAction = (action: LogAction) => {
+        this.logActionFunction = action
+    }
+
+    private logAction = (log: LogPayload) => {
+        if (this.logActionFunction) {
+            this.logActionFunction(log)
+        }
+    }
+
+    private logHit = (killer: Field, victim: Field, damage: number) => {
+        this.logAction({ 
+            instigator: {
+                target: killer.code,
+                type: LogInstigatorType.field },
+            action: LOG_ACTIONS.hit(damage),
+            target: victim.code
+        })
+    }
+
+    private logDeath = (victim: Field) => {
+        this.logAction({ 
+            instigator: {
+                target: victim.code,
+                type: LogInstigatorType.field },
+            action: LOG_ACTIONS.die,
+            target: null
+        })
     }
 
     hit = (killer: Field | null, victim: Field | null, damage: number) => {
         if (killer && victim && killer.elemental && victim.elemental) {
             victim.elemental.hit(damage)
+            this.logHit(killer, victim, damage)
 
             if (victim.elemental.isDead) {
+                this.logDeath(victim)
                 const totalPoint = killer.elemental.guild.pointsForKill > 0
                     ? victim.elemental.guild.extraPointsForDeath + killer.elemental.guild.pointsForKill
                     : 0
 
                 this.points.addPointToOppositeTeam(victim.parent.user![1], totalPoint)
-                this.usersCards.get(victim.parent.user![0])?.leftCardsDeck.add(victim.elemental.mobData)
+                this.usersCards.get(victim.parent.user![0])?.left.add(victim.elemental.mobData)
                 victim.delete()
             }
         }
@@ -1803,8 +2280,11 @@ export class Killer {
     hitWithoutDeath = (killer: Field | null, victim: Field | null, damage: number) => {
         if (killer && victim && killer.elemental && victim.elemental) {
             victim.elemental.hit(damage)
+            this.logHit(killer, victim, damage)
 
             if (victim.elemental.isDead) {
+                this.logDeath(victim)
+
                 const totalPoint = killer.elemental.guild.pointsForKill > 0
                     ? victim.elemental.guild.extraPointsForDeath + killer.elemental.guild.pointsForKill
                     : 0
@@ -1816,88 +2296,97 @@ export class Killer {
 }
 
 
-export interface ActionStrategy {
-    start(): void 
-    stop(): void
-    setController(controller: StrategyController): void 
+export abstract class ActionStrategy {
+    protected logActionFunction: LogAction | undefined
+    protected strategyController: StrategyController | null = null
+    protected turn: Turn
+
+    abstract start(onFinish?: Function): void 
+    abstract stop(onFinish?: Function): void
+
+    setController = (controller: StrategyController): void  => {
+        this.strategyController = controller
+    }
+    setLogAction = (action: LogAction): void => {
+        this.logActionFunction = action
+    }
+
+    constructor(turn: Turn) {
+        this.turn = turn
+    }
+
+    protected logAction = (log: LogPayload) => {
+        if (this.logActionFunction) {
+            this.logActionFunction(log)
+        }
+    }
 }
 
-export class Draw implements ActionStrategy {
+export class Draw extends ActionStrategy {
     private readonly cardsController: CardsController
     private readonly fieldsController: FieldsController
     private readonly points: PointsManager
-    private strategyController: StrategyController | null = null
-    private turn: Turn 
+
+    setLogAction = (action: LogAction) => {
+        this.logAction = action
+    }
 
     constructor (cards: CardsController, points: PointsManager, fieldsController: FieldsController, turn: Turn) {
+        super(turn)
         this.points = points
         this.cardsController = cards
         this.fieldsController = fieldsController
         this.turn = turn
     }
 
-    setController(controller: StrategyController): void {
-        this.strategyController = controller
-    }
-
     start = () => {
+        this.logAction({ action: LOG_ACTIONS.draw })
         this.cardsController.replenishHandDeck()
-        let countOfEmptyNodes = 0
-
-        this.fieldsController.iterateThroughMyNodes(node => {
-            const isControlledArea = node.user && node.user[0] === this.turn.currentTurn 
-                && node.up && node.up.isEmpty && !node.isEmpty
-            
-            if (isControlledArea) {
-                countOfEmptyNodes++            
-            }
-        })
-
-        this.points.addPointToCurrentTurnPlayer(countOfEmptyNodes)
-        this.strategyController && this.strategyController.stop()
+        this.points.addPointToCurrentTurnPlayer(this.fieldsController.calculateControllerNodesByUser(this.turn.currentTurn))
+        this.stop()
     }
 
     stop = () => {
-       this.strategyController?.stopImmediately()
+       this.strategyController && this.strategyController.stop()
     }
 }
 
-export  type GameStrategyCodeType = 'DRAW' | 'ACTIVATE' | 'SPAWN'
 
-export abstract class SequentialStrategy implements ActionStrategy {
+export abstract class SequentialStrategy extends ActionStrategy {
     readonly data: MobData
     abstract code: GameStrategyCodeType
     protected readonly interactedFields: Field[] = []
     protected readonly cardsController: CardsController
     protected readonly fieldsController: FieldsController
     protected readonly killer: Killer
-    protected readonly MAX_COUNT_CARD: number = 3
     protected activeGuild: Guild | null = null
     protected activeValue: number | null = null
     protected response: null | Function = null
     protected canChoose: boolean = false
-    protected strategyController: StrategyController | null = null
+    index: number = 0
 
-    constructor (cards: CardsController, killer: Killer, fieldsController: FieldsController, data: MobData) {
+    constructor (cards: CardsController, killer: Killer, fieldsController: FieldsController, data: MobData, turn: Turn) {
+        super(turn)
         this.killer = killer
         this.cardsController = cards
         this.fieldsController = fieldsController
         this.data = data 
     }
 
-    setController = (controller: StrategyController) => {
-        this.strategyController = controller
-    }
-
-    abstract startAction(): void
-
     chooseGuild = () => {
-        this.activeGuild = this.data.guild
-
-        this.startAction()
+        if (this.canChoose) {
+            this.activeGuild = this.data.guild
+            this.startAction()
+        }
     }
+
     abstract highlightByValue (): void
     abstract highlightByGuild (): void
+    abstract startAction(): void
+
+    protected get interactType () {
+        return this.activeGuild ? 'guild' : 'value'
+    }
 
     resetHighlights = () => {
         this.cardsController.resetHighlights()
@@ -1905,9 +2394,10 @@ export abstract class SequentialStrategy implements ActionStrategy {
     }
 
     chooseValue = () => {
-        this.activeValue = this.data.value
-
-        this.startAction()
+        if (this.canChoose) {
+            this.activeValue = this.data.value
+            this.startAction()
+        }
     }
 
     start(): void {
@@ -1917,51 +2407,91 @@ export abstract class SequentialStrategy implements ActionStrategy {
     decline = () => {
         this.cardsController.reset()
         this.fieldsController.reset()
-        this.strategyController?.stopImmediately(false)
+        this.strategyController?.stop(true)
     }
 
     stop = () => {
         this.cardsController.reset()
         this.fieldsController.reset()
-        this.strategyController?.stopImmediately()
+        this.strategyController?.stop()
+    }
+
+    stopImmediately = () => {
+        this.logAction({ action: LOG_ACTIONS.stop_turn })
+        this.stop()
     }
 }
 
+const MAX_ACTIVATION_ITERATION = 3
+const MAX_SPAWN_ITERATION = 3
 
 export class Spawn extends SequentialStrategy {
-    code: GameStrategyCodeType = 'SPAWN'
+    code: GameStrategyCodeType = GameStrategyCodeType.spawn
 
-    startAction = async () => {
-        for (let i = 0; i < Math.max(this.MAX_COUNT_CARD, this.cardsController.handCardDeck.cards.length); i++) {
-            let data: MobData | null = null
-
-            if (this.activeValue) {
-                data = await this.cardsController.getCardsSameValueAsync(this.activeValue)
-            } else if (this.activeGuild) {
-                data = await this.cardsController.getCardsSameGuildAsync(this.activeGuild)
+    private choosePlace = (data: MobData | null, i: number , cb: Function) => {
+    
+        if (data) {
+            const fieldHandler = (field: Field) => {
+                this.spawnElemental(field, data) 
+                this.logAction({ type: 'extra', action: LOG_ACTIONS.spawned, target: data.code })
+                cb()
             }
-
-            if (data) {
-                let field: Field | null
-
-                if (i === 0) {
-                    field = await this.fieldsController.getMyAnyLastEmptyFieldAsync()
-                } else if (i === 1) {
-                    field = await this.fieldsController.getLastNeighBoorsAndCurrentAsync(this.interactedFields[0])
-                } else {
-                    field = await this.fieldsController.getMyNeighBoorLastEmptyFieldAsync(this.interactedFields)
-                }
-
-                if (field) {
-                    field!.createElemental(data) 
-                    await field!.elemental?.guild.spawn(field!, this.fieldsController, this.killer, this.cardsController,)
-                    this.interactedFields.push(field!)
-                }
-            }
+            if (i === 0) {
+                this.fieldsController.getUserAnyLastEmptyFieldAsync(this.turn.currentTurn ,[], fieldHandler)
+            } else if (i === 1) {
+                this.fieldsController.getLastNeighBoorsAndCurrentEmptyFieldAsync(this.interactedFields[0], fieldHandler)
+            } else {
+                this.fieldsController.getNeighBoorLastEmptyFieldAsync(this.interactedFields, fieldHandler)
+            }   
+        } else {
+            this.stop()
         }
-
-        this.stop()
     }
+
+    private spawnElemental = (field: Field | null, data: MobData | null) => {
+        if (field && data) {
+            field!.createElemental(data) 
+            field!.elemental?.guild.spawn(field!, this.fieldsController, this.killer, this.cardsController, () => {
+                this.interactedFields.push(field!)
+            })
+        }
+    }
+
+    private isEnd = (i: number) => {
+        return i >= Math.max(MAX_SPAWN_ITERATION, this.cardsController.hand.cards.length)
+    }
+
+    private iterate = (index: number, cb: Function) => {
+        if (!this.isEnd(index)) {
+
+            this.logAction({ action: LOG_ACTIONS.start_action_iteration, type: 'util'})
+
+            this.index = index
+            const recurse = () => this.iterate(index + 1, cb)
+            if (this.activeValue) {
+        
+                this.cardsController.getCardsSameValueAsync(this.activeValue, data => {
+                   this.choosePlace(data, index, recurse)
+                })
+        
+            
+            } else if (this.activeGuild) {
+                this.cardsController.getCardsSameGuildAsync(this.activeGuild, data => this.choosePlace(data, index, recurse))
+            }
+        } else {
+            cb()
+        }
+    }
+
+    startAction = () => {
+        if (this.data) {
+            this.logAction({ action: LOG_ACTIONS.spawnBy(this.interactType), target: this.data.code})
+            this.choosePlace(this.data, 0, () => {
+                this.iterate(1, this.stop)
+            })
+        }
+    }
+
 
     highlightByGuild(): void {
         this.cardsController.highlightCardsSameGuild(this.data.guild)
@@ -1973,157 +2503,63 @@ export class Spawn extends SequentialStrategy {
 }
 
 export class Activation extends SequentialStrategy {
-    code: GameStrategyCodeType = 'ACTIVATE'
-    startAction = async () => {
-        this.cardsController.moveCardFromHandToLeft(this.data)
-        let countOfAvailableCards = 0
+    code: GameStrategyCodeType = GameStrategyCodeType.activate
 
-        if (this.activeValue !== null) {
-            this.fieldsController.highLightMyElementalsByGuild(this.data, [], false)
-        } else {
-            this.fieldsController.highlightMyElementalsByValue(this.data, [], false)
-        }
-
-        countOfAvailableCards = this.fieldsController.highlighted.size
-        this.fieldsController.resetHighlights()
-
-        for (let i = 0; i < Math.min(this.MAX_COUNT_CARD, countOfAvailableCards); i++) {
-            let field: Field | null
-
-            if (this.activeValue !== null) {
-                field = await this.fieldsController.getMyElementalsByValueAsync(this.data, this.interactedFields)
-            } else {
-                field = await this.fieldsController.getMyElementalByGuildAsync(this.data, this.interactedFields)
-            }
-    
-            if (field) {
-                await field!.elemental?.guild.activate(field!, this.fieldsController, this.killer, this.cardsController,)
+    private activateELemental = (field: Field | null, cb: Function) => {
+        if (field) {
+            field!.elemental?.guild.activate(field!, this.fieldsController, this.killer, this.cardsController, () => {
                 this.interactedFields.push(field)
-            }
+                this.logAction({ type: 'extra', action: LOG_ACTIONS.activated, target: field.code })
+                cb()
+            })
+        } else {
+            this.stop()
         }
+    }
 
-        this.stop()
+    private iterate = (index: number, cb: Function) => {
+        if (index < MAX_ACTIVATION_ITERATION) {
+            this.index = index
+            const recurse = () => this.iterate(index + 1, cb)
+            if (this.activeValue !== null) {
+                this.fieldsController.getTeamElementalsByValueAsync(this.turn.currentTurnTeam, this.data, this.interactedFields, field => {
+                    this.activateELemental(field, recurse)
+                }, { autoReturn: false })
+            } else {
+                this.fieldsController.getTeamElementalByGuildAsync(this.turn.currentTurnTeam, this.data, this.interactedFields, field => {
+                    this.activateELemental(field, recurse)
+                }, {
+                    autoReturn: false
+                })
+            }
+        } else {
+            cb()
+        }
+    }
+
+    startAction = () => {
+        if (this.data) {
+            this.cardsController.left.add(this.data)
+            this.logAction({ action:  LOG_ACTIONS.activateBy(this.interactType), target: this.data.code })
+            this.iterate(0, this.stop)
+        }
     }
 
     highlightByGuild(): void {
-        this.fieldsController.highLightMyElementalsByGuild(this.data, [])
+        this.fieldsController.highLightTeamElementalsByGuild(this.turn.currentTurnTeam, this.data, [])
     }
 
     highlightByValue(): void {
-        this.fieldsController.highlightMyElementalsByValue(this.data, [])
+        this.fieldsController.highlightTeamElementalsByValue(this.turn.currentTurnTeam, this.data, [])
     }
 }
 
-export type DraftStage  = 'ban' | 'pick'
-
-type DraftConfig = Partial<{
-    withExtension: boolean
-    withBan: boolean
-    draftTemplates: DraftStage[]
-    guildsPerPlayer: number
-}>
-
-export class Draft extends Stage {
-    guilds: GuildsPoolController
-    readonly turn: Turn
-    private readonly stagesTemplate: DraftStage[] = []
-    private currentStageIndex: number = 0
-    usersDraft: Map<User, UserDraft> 
-    private stopped: boolean = false
-
-    constructor(turn: Turn, controller: GameStageController, config?: DraftConfig) {
-        super('DRAFT', controller)
-        makeObservable(this, {
-
-        })
-        this.stagesTemplate = config?.draftTemplates || ['pick']
-        this.turn= turn
-        const builder = new DraftContentBuilder(turn)
-
-        builder
-            .formatGuildsPool(config?.withBan || false, config?.withExtension || false)
-            .setMaxCountOfGuildsPerUser(config?.guildsPerPlayer)
-            
-        this.guilds = builder.guilds
-        this.usersDraft = builder.usersDraft
-    }
-
-    currentUserDraft = () => {
-        return this.getDraftByUser(this.turn.currentTurn)
-    }
-
-    getDraftByUser = (user: User) => {
-        return this.usersDraft.get(user)!
-    }
-
-    nextStage = () => {
-        this.currentStageIndex = this.currentStageIndex === this.stagesTemplate.length - 1
-            ? 0
-            : this.currentStageIndex + 1
-    }
-
-    get currentStage() {
-        return this.stagesTemplate.length === 0
-            ? 'pick'
-            : this.stagesTemplate[this.currentStageIndex]
-    }
-
-    setRandomDrafts = () => {
-        while(!this.isEnd()) {
-            this.currentUserDraft().choose(this.guilds.takeRandomGuildSync())
-            this.turn.next()
-        } 
-
-        this.stageController.syncState()
-    }
-
-    isEnd = () => {
-        let isEnd = true
-
-        for (let draft  of this.usersDraft.values()) {
-            isEnd = draft.isDraftFull
-        }
-
-        return isEnd || this.stopped
-    }
-
-    pause = () => {
-        this.stopped = true
-    }
-
-    stop = () => {
-        this.stageController.setGameStage(new GameProcess(this.turn, this.stageController, this.usersDraft), true)
-    }
-
-    processIterate = async () => {
-        const guild = await this.guilds.getGuildAsync()
-
-        if (this.currentStage === 'pick') {
-            this.currentUserDraft().choose(guild)
-        } else {
-            this.currentUserDraft().ban(guild)
-        }
-
-        this.turn.next()
-    }
-
-    start = async() => {
-        this.stopped = false
-
-        while (!this.isEnd()) {
-            await this.processIterate()
-        }
-
-        this.stageController.syncState()
-        this.stop()
-    }
-}
 
 
 export class DraftContentBuilder {
     usersDraft: Map<User, UserDraft> = new Map<User, UserDraft>()
     guilds: GuildsPoolController = new GuildsPoolController()
-    draftStages: DraftStage[] = ['pick']
+    draftStages: DraftStage[] = [DraftStage.pick]
     private users: UsersStorage
 
     constructor(users: UsersStorage) {
@@ -2131,15 +2567,10 @@ export class DraftContentBuilder {
         this.formatGuildDrafts()
     }
 
-    parseUserDrafts = (data: Map<User, UserPicks>) => {
-        for (let [user, picks] of data.entries()) {
-            const draft = new UserDraft()
-
-            draft.setBanned(this.getGuildSet(picks.bans))
-            draft.setChosen(this.getGuildSet(picks.picks))
-
-            this.usersDraft.set(user, draft)
-        }
+    parseUserDrafts = (data: Map<User, ServerUserPicks>) => {
+        data.forEach((picks, user) => {
+            this.usersDraft.set(user, UserDraftMapper.toDomain(picks))
+        })
 
         return this
     }
@@ -2150,7 +2581,8 @@ export class DraftContentBuilder {
         return this
     }
 
-    formatGuildsPool = (withBan: boolean, withExtension: boolean) => {
+    formatGuildsPool = (withExtension: boolean) => {
+        const withBan = this.draftStages.includes(DraftStage.ban)
         const playersCount = this.users.playersCount
         const needExtension = playersCount > 2 || withExtension || withBan
         const initPool: GuildCode[] = shuffleArray([...BASE_GUILDS_CODE, ...needExtension ? ADD_GUILDS : []])
@@ -2164,13 +2596,15 @@ export class DraftContentBuilder {
         const teams = this.users.teams
 
         for (let i = 0; i < (count); i++) {
-            teams.forEach(team => {
-                team.users.forEach(user => {
-                    this.usersDraft
-                        .get(user)!
-                        .choose(this.guilds.takeRandomGuildSync())
+            if (this.guilds.guilds.length >= Array.from(this.usersDraft.keys()).length) {
+                teams.forEach(team => {
+                    team.users.forEach(user => {
+                        this.usersDraft
+                            .get(user)
+                            ?.choose(this.guilds.takeRandomGuildSync()!)
+                    })
                 })
-            })
+            }
         }
 
         return this
@@ -2178,7 +2612,7 @@ export class DraftContentBuilder {
 
     setMaxCountOfGuildsPerUser = (maxGuildsCountPerPlayer?: number) => {
         const leftGuildsPerStage = this.maxCountPlayersPerTeam * this.users.teams.length
-        const countOfBanStagesPerRound = this.draftStages.reduce((acc, stage) => stage === 'ban' ? acc + 1 : acc ,0)
+        const countOfBanStagesPerRound = this.draftStages.reduce((acc, stage) => stage === DraftStage.ban ? acc + 1 : acc ,0)
         const countOfBanGuildsPerRound = countOfBanStagesPerRound * leftGuildsPerStage
         const countOfLeftGuildsPerRound = this.draftStages.length * leftGuildsPerStage
         const countOfRounds = Math.floor(this.guilds.guilds.length / countOfLeftGuildsPerRound)
@@ -2215,7 +2649,7 @@ export class DraftContentBuilder {
         if (template &&  this.checkDraftTemplate(template, minGuildsCountPerPlayer)) {
            this.draftStages = template
         } else {
-            this.draftStages = withBan ? ['pick', 'ban'] : ['pick']
+            this.draftStages = withBan ? [DraftStage.pick, DraftStage.ban] : [DraftStage.pick]
         }
 
         return  this
@@ -2234,7 +2668,7 @@ export class DraftContentBuilder {
         if (template.length > 0) {
             while (countOfGuilds > 0 && countOfGuilds >= leftGuildsPerTemplateStages ) {
                 template.forEach(stage => {
-                    if (stage === 'pick') {
+                    if (stage === DraftStage.pick) {
                         countChosenGuildsPerPlayer++
                     }
                     countOfGuilds = countOfGuilds - leftGuildsPerStage
@@ -2262,42 +2696,42 @@ const shuffleArray = (array: any[]) => {
 }
 
 
-interface StrategyController {
-    setStrategy(strategy: ActionStrategy | null): void
-    stop(): void 
-    stopImmediately: (value?: boolean) => void
-}
+
 
 class ActionController implements StrategyController {
     strategy: ActionStrategy | null = null
-    stopImmediately = (_?: boolean) => {}
+    onFinish: ((needRepeate: boolean) =>  void) | undefined
+    logAction: LogAction | undefined
 
+    setLogAction = (action: LogAction): void => {
+        this.logAction =  action
+    }
 
     setStrategy = (strategy: ActionStrategy | null) => {
         this.strategy = strategy
 
         if (this.strategy) {
             this.strategy.setController(this)
+            
+            if (this.logAction) {
+                this.strategy.setLogAction(this.logAction)
+            }
         }   
     }
 
-    start = async () => {
+    start = (cb?: (value: boolean) => void) => {
         if (this.strategy) {
-            this.strategy.start()
-            return new Promise((res) => {
-                this.stopImmediately = res
-            }).then((res) => {
-                this.stopImmediately = (_?: boolean) => {}
-                this.strategy = null
-                return res ?? true
-            })
+            this.onFinish = cb
+            this.strategy.start()            
         }
     }
 
-    stop = () => {
-        if (this.strategy) {
-            this.stopImmediately()
-        }
+    stop = (needRepeat?: boolean) => {
+       this.strategy = null
+
+       if (this.onFinish) {
+            this.onFinish(!!needRepeat)
+       }
     }
 
     get hasStrategy () {
@@ -2305,121 +2739,340 @@ class ActionController implements StrategyController {
     }
 }
 
-export class GameRoom extends Stage {
-    teams: Team[] = []
-    maxPlayers: number = 2
 
-    constructor (controller: GameStageController) {
-        super('ROOM', controller)
+export abstract class Stage<Prev = object, Def = unknown, NextInput = object> {
+    code: StageCode | InGameCode
+    controller: IStageController
+    next: Stage<NextInput> | null = null
+    defaultData: Def | undefined
+    loading: boolean = false
+    isBigDaddy: boolean = true
+
+    constructor(code: StageCode | InGameCode, controller: IStageController, isBigDaddy: boolean, def?: Def) {
+        this.code = code
+        this.controller = controller
+        this.isBigDaddy = isBigDaddy
+        this.defaultData = def
+        this.setDefaultData.bind(this)
+        this.stop.bind(this)
+        makeObservable(this, {
+            loading: observable
+        })
     }
 
-    start(): void {
-        
+    setDefaultData(data?: Def) {
+        this.defaultData = data
     }
 
-    stop(): void {
-        
+    setBigDaddyStatus = (status: boolean) => {
+        this.isBigDaddy = status
     }
 
-    get maxPlayersPerTeam () {
-        return Math.ceil(this.maxPlayers / 2)
+    setLoading = (status: boolean) => {
+        this.loading = status
     }
 
-    get currentCountOfPlayers () {
-        return this.teams.reduce((acc, t) => acc + t.users.length, 0)
+    setStageController = (controller: IStageController) => {
+        this.controller = controller
     }
 
-    addUserToTeam = (user: User, teamId: string) => {
-        const foundTeam = this.teams.find(t => t.id === teamId)
-
-        if (foundTeam && foundTeam.users.length < this.maxPlayersPerTeam && this.currentCountOfPlayers < this.maxPlayers) {
-            foundTeam.addUser(user)
-        }     
+    setNext = (stage: Stage<NextInput>) => {
+        this.next = stage
     }
 
+    stop = () => {
+        if (this.isBigDaddy) {
+            if (this.next) {
+                this.controller.setStage(this.next as any)
+                this.next.start(this.formatDataForNextStage())
+            } else {
+                this.controller.stop()
+            }
+        }
+    }
+
+    formatDataForNextStage = (): NextInput | undefined => {
+        return undefined
+    }
+
+    abstract start(prev?: Prev): void
 }
 
-export class GameEnd extends Stage {
-    constructor (controller: GameStageController) {
-        super('END', controller)
-    }
+export abstract class InGameStage<Prev = unknown, Def = unknown> extends Stage<Prev, Def> {
+    readonly turn: Turn
+    readonly logActionHandler: LogAction | undefined
 
-    start(): void {
-        
-    }
-
-    stop(): void {
-        
-    }
-
-    restart = () => {
-        // this.stageController.setGameStage()
-    }
-
-    goToRoomMenu = () => {
-        // this.stageController.setGameStage()
-    }
-}
-
-export class GameProcess extends Stage {
-    turn: Turn
-    points: PointsManager
-    gameField: FieldsController
-    private killer: Killer
-    usersCards: UsersCards
-    action: ActionController = new ActionController()
-    private stopped: boolean = false
-
-    constructor(turn: Turn, controller: GameStageController, drafts?: Map<User, UserDraft>) {
-        super('GAME', controller)
+    constructor(code: InGameCode, controller: IStageController, turn: Turn, isBigDaddy: boolean, logAction?: LogAction, def?: Def) {
+        super(code, controller, isBigDaddy, def)
+        this.defaultData = def
         this.turn = turn
-        this.points = new PointsManager(turn)
-        const builder = new GameContentBuilder(turn)
+        this.logActionHandler = logAction
+        this.start.bind(this)
+    }
 
-        if (drafts && turn.isMyTurn) {
-            builder
-                .createGameField()
-                .formatInitDecks(drafts)
-                .addCardToCenter()
+    start(_?: Prev): void {
+        if (this.logActionHandler) {
+            this.logActionHandler({
+                instigator: { 
+                    type: LogInstigatorType.user,
+                    target: this.turn.currentTurn.id
+                },
+                action: LOG_ACTIONS.start_stage,
+                target: this.code
+             })
+        }
+    }
+
+    stop = () => {
+        if (this.logActionHandler) {
+            this.logActionHandler({
+                instigator: { 
+                    type: LogInstigatorType.user,
+                    target: this.turn.currentTurn.id
+                },
+                action: LOG_ACTIONS.stop_stage,
+                target: this.code
+             })
+        }
+        super.stop()
+    }
+
+    abstract setLogAction(action: LogAction): void
+
+    logAction = (log: LogPayload) => {
+        this.logActionHandler && this.logActionHandler(log)
+    }
+
+    abstract setEnabled(status: boolean): void
+}
+
+export class Draft extends InGameStage<DraftConfig, DefaultPicks> {
+    guilds: GuildsPoolController = new GuildsPoolController()
+    private stagesTemplate: DraftStage[] = []
+    private currentStageIndex: number = 0
+    usersDraft: Map<User, UserDraft> = new Map()
+
+    constructor(turn: Turn, controller: IStageController, isBigDaddy: boolean, logAction?: LogAction, picks?: DefaultPicks) {
+        super(InGameCode.draft, controller, turn, isBigDaddy, logAction, picks)
+        makeObservable(this, {
+
+        })
+        logAction && this.setLogAction(logAction)
+        this.start.bind(this)
+    }
+
+    setLogAction = (action: LogAction) => {
+        this.logAction = action   
+        this.guilds.setLogAction(action)
+    }
+
+    setEnabled = (status: boolean): void  => {
+        this.guilds.setEnabled(status)
+    }
+
+    currentUserDraft = () => {
+        return this.getDraftByUser(this.turn.currentTurn)
+    }
+
+    getDraftByUser = (user: User) => {
+        return this.usersDraft.get(user)!
+    }
+
+    nextStage = () => {
+        this.currentStageIndex = this.currentStageIndex === this.stagesTemplate.length - 1
+            ? 0
+            : this.currentStageIndex + 1
+    }
+
+    get currentStage(): DraftStage {
+        return this.stagesTemplate.length === 0
+            ? DraftStage.pick
+            : this.stagesTemplate[this.currentStageIndex]
+    }
+
+    get hasBanStage() {
+        return this.stagesTemplate.includes(DraftStage.ban)
+    }
+
+    setRandomDrafts = () => {
+        while(!this.isEnd()) {
+            if (this.guilds.guilds.length > 0) {
+                this.currentUserDraft().choose(this.guilds.takeRandomGuildSync()!)
+                this.turn.next()
+            }
         } 
+    }
 
-        this.gameField = builder.gameField
-        this.usersCards = builder.userCards
+    isEnd = () => {
+        return [...this.usersDraft.values()].every(draft => draft.isDraftFull)
+    }
+
+    formatDataForNextStage = () => {
+        return this.usersDraft
+    }
+
+    processIterate = (cb?: Function) => {
+        if (this.turn.isMyTurn) {
+            this.guilds.setHighlightable(true)
+            this.guilds.setClickable(true)
+        }
+
+        this.guilds.getGuildAsync(guild => {
+            if (!guild) {
+                return this.stop()
+            }
+
+            if (this.currentStage === DraftStage.pick) {
+                this.logAction({ type: 'extra', action: LOG_ACTIONS.pick, target: guild.code })
+                this.currentUserDraft().choose(guild)
+            } else {
+                this.logAction({ type: 'extra', action: LOG_ACTIONS.ban, target: guild.code })
+                this.currentUserDraft().ban(guild)
+            }
+            
+            this.turn.next()
+            this.guilds.setHighlightable(false)
+            this.guilds.setClickable(false)
+           
+            if (this.turn.currentTurn === this.turn.firstTurnUser) {
+                this.nextStage()
+            }
+
+            cb && cb()
+        })
+    }
+
+    takeAllGuilds = (cb: Function) => {
+        if (!this.isEnd()) {
+            this.processIterate(() => this.takeAllGuilds(cb))
+        } else {
+            cb()
+        }
+    }
+
+    start(config?: DraftConfig) {
+        super.start()
+        const builder = new DraftContentBuilder(this.turn)
+        this.stagesTemplate = config?.draftTemplates || [DraftStage.pick]
+
+        if (this.defaultData) {
+            builder
+                .parseGuildsPool(this.defaultData.total)
+                .parseUserDrafts(this.defaultData.users)
+        } else {
+            builder
+                .formatGuildsPool(config?.withExtension || false)
+                .setMaxCountOfGuildsPerUser(config?.guildsPerPlayer)
+        }
+ 
+        this.guilds = builder.guilds
+        this.usersDraft = builder.usersDraft
+        this.guilds.setLogAction(this.logAction)
+
+        this.takeAllGuilds(() => {
+            this.stop()
+        })
+    }
+}
+
+
+export class GameProcess extends InGameStage<Map<User, UserDraft>, DefaultProcessGameState> {
+    points: PointsManager
+    gameField: FieldsController = new FieldsController()
+    killer: Killer
+    usersCards: UsersCards = new Map()
+    action: ActionController = new ActionController()
+
+    constructor(turn: Turn, controller: IStageController, isBigDaddy: boolean, logActionFunction?: LogAction, defaultState?: DefaultProcessGameState) {
+        super(InGameCode.process, controller, turn, isBigDaddy, logActionFunction)
+        this.defaultData = defaultState
+        this.points = new PointsManager(turn)
         this.killer = new Killer(this.usersCards, this.points)
-        this.stageController.stopLoading()
+        logActionFunction && this.setLogAction(logActionFunction)
+        this.start.bind(this)
+    }
+
+    setEnabled = (status: boolean) => {
+        this.usersCards.forEach(controller => controller.setEnabled(status))
+        this.gameField.setEnabled(status)
+    }
+
+    setLogAction = (action: LogAction): void => {
+        this.usersCards.forEach(controller => {
+            controller.setLogAction(action)
+        })
+        this.gameField.setLogAction(action)
+        this.action.setLogAction(action)
+        this.killer.setLogAction(action)
     }
 
     currentDeck = () => {
         return this.getCertainUserDeck(this.turn.currentTurn)!
     }
 
-    stop() {
-        this.stopped = true
-        this.stageController.setGameStage(new GameEnd(this.stageController))
-    }
-
     isEnd = () => {
-        return this.points.isEndOfTheGame || this.stopped
+        return this.points.isEndOfTheGame
     }
 
-    start = async() => {
-        while (!this.isEnd()) {
+    iterate = (cb: Function) => {
+        if (!this.isEnd()) {
             if (this.turn.isMyTurn) {
-                this.gameField.setEnabled(true)
-                this.currentDeck().setEnabled(true)
-                await this.interactWithCard()
-                this.turn.next()
-                this.stageController.syncState()
-            } else {
-                this.gameField.setEnabled(false)
-                this.currentDeck().setEnabled(false)
-            }
-        }
+                this.gameField.setHighlightable(true) 
+                this.gameField.setClickable(!this.turn.isGuest)   
+                this.currentDeck().setClickable(!this.turn.isGuest)
+                this.currentDeck().setClickable(true)
 
-        this.stop()
+                this.interactWithCard(() => {
+                    this.turn.next()
+                    this.iterate(cb)
+                })
+            } else {
+                this.gameField.setHighlightable(false)
+                this.gameField.setClickable(false)
+                this.currentDeck().setClickable(false)
+                this.currentDeck().setClickable(false)
+            }
+        } else {
+            cb()
+        }
     }
 
-    private getCertainUserDeck = (user: User): CardsController => {
+    start(drafts?: Map<User, UserDraft>) {
+        super.start(drafts)
+
+        if (drafts || this.defaultData) {
+            const builder = new GameContentBuilder(this.turn)
+
+            if (drafts && this.turn.isMyTurn) {
+                builder
+                    .createGameField()
+                    .formatInitDecks(drafts)
+                    .addCardToCenter()
+            } else if (this.defaultData) {
+                this.points.setPoints(this.defaultData.points)
+
+                builder
+                    .createGameField(this.defaultData.fields)
+                    .parseUserDecks(this.defaultData.cards)
+            }
+
+            this.gameField = builder.gameField
+            this.usersCards = builder.userCards
+
+            if (this.logActionHandler) {
+                this.usersCards.forEach(controller => {
+                    controller.setLogAction(this.logActionHandler!)
+                })
+                this.gameField.setLogAction(this.logActionHandler)
+            }
+    
+            this.iterate(() => {
+                this.stop()
+            })
+        }
+    }
+
+    getCertainUserDeck = (user: User): CardsController => {
         return this.usersCards.get(user)!
     }
 
@@ -2428,7 +3081,7 @@ export class GameProcess extends Stage {
     }
 
     setActivation = (mobData: MobData) => {
-        this.setStrategy(new Activation(this.currentDeck(), this.killer, this.gameField, mobData))
+        this.setStrategy(new Activation(this.currentDeck(), this.killer, this.gameField, mobData, this.turn))
     }
 
     setDraw = () => {
@@ -2436,144 +3089,1232 @@ export class GameProcess extends Stage {
     }
 
     setSpawn = (mobData: MobData) => {
-        this.setStrategy(new Spawn(this.currentDeck(), this.killer, this.gameField, mobData))
+        this.setStrategy(new Spawn(this.currentDeck(), this.killer, this.gameField, mobData, this.turn))
     }
 
-    interactWithCard = async () => {
-        do {
-            const { message, target } = await this.currentDeck().getSomeCardCommand()!
-            debugger
+    interactWithCard = (cb: Function) => {
+        this.currentDeck().getSomeCardCommandAsync(({ message, target }) => {
             switch (message) {
-                case CardsActionMessages.activate:
-                    this.setActivation(target)
+                case LOG_ACTIONS.activate:
+                    this.setActivation((target as Card).mobData)
                     break
-                case CardsActionMessages.summon:
-                    this.setSpawn(target)
+                case LOG_ACTIONS.summon:
+                    this.setSpawn((target as Card).mobData)
                     break
-                case CardsActionMessages.draw:
+                case LOG_ACTIONS.draw:
                     this.setDraw()
                     break
             }
+            this.action.start(needRepeat => {
+                if (needRepeat) {
+                    return this.interactWithCard(cb)
+                } else {
+                    cb()
+                }
+            })
+        })
+    }
+}
+
+// export type DraftConfig = Partial<{
+//     withExtension: boolean
+//     withBan: boolean
+//     draftTemplates: DraftStage[]
+//     guildsPerPlayer: number
+// }>
+
+
+
+export class UserWithReadyStatus extends User {
+    ready: boolean = false
+
+    constructor(user: User, ready: boolean = false) {
+        super(user.id, user.name, user.email, user.avatar, user.rating)
+        this.ready = ready
+
+        makeObservable(this, {
+            ready: observable,
+            setReady: action
+        })
+    }
+
+    setReady = (status: boolean) => {
+        this.ready = status
+    }
+}
+
+
+
+const initData: ServerRoomPropsPayload = {
+    withExtension: false,
+    playersCount: 2,
+    draftStages: [DraftStage.pick],
+    name: '',
+    password: null,
+    type: RoomType.public
+}
+
+
+export class GameRoomPropsController {
+    canEdit: boolean = true
+    playersCount: number = initData.playersCount
+    withExtension: boolean = initData.withExtension
+    draftStages: DraftStage[] = initData.draftStages
+    name: string = initData.name
+    password: ValidationField = new ValidationField(initData.password, yup.string().min(3) )
+    type: RoomType = initData.type
+    initData: ServerRoomPropsPayload
+
+    constructor(data?: ServerRoomPropsPayload, canEdit?: boolean) {
+        this.initData = data || initData
+        this.canEdit = canEdit || true
+        makeAutoObservable(this)
+        data && this.setData(data)
+    }
+
+    setCanEdit = (status: boolean) => {
+        this.canEdit = status
+    }
+
+    updateInitData = () => {
+        this.initData = {
+            ...this,
+            password: this.password.data as string,
+        }
+    }
+
+    setData = ({ withExtension, draftStages, name, playersCount, type, password }: ServerRoomPropsPayload) => {
+        this.withExtension = withExtension
+        this.draftStages = draftStages
+        this.playersCount = playersCount
+        this.password.setValue(password)
+        this.type = type
+        this.name = name
+    }
+
+    patchData = ({ withExtension, draftStages, name, playersCount, type, password }: Partial<ServerRoomPropsPayload>) => {
+        this.withExtension = withExtension || this.withExtension
+        this.draftStages = draftStages || this.draftStages
+        this.playersCount = playersCount || this.playersCount
+        password && this.password.setValue(password) 
+        this.type = type || this.type
+        this.name = name || this.name
+    }
+
+    resetData = () => {
+        this.setData(this.initData)
+    }
+
+    setInitData = (data: ServerRoomPropsPayload) => {
+        this.initData = data
+    }
+
+    setPlayersCount = (value: 2 | 3 | 4) => {
+        if ([2, 3, 4].includes(value) && this.canEdit) {
+            this.playersCount = value
+
+            this.setWithExtension(true)
+        }
+    }
+
+    setRoomType = (roomType: RoomType) => {
+        if (this.canEdit) {
+            this.type = roomType
+
+            if (this.type === RoomType.public) {
+                this.password.setValue(null)
+            }
+        } 
+    }
+
+    addStage = (stage: DraftStage) => {
+        if (this.canEdit) {
+            this.draftStages.push(stage)
+
+            if (stage === DraftStage.ban) {
+                this.setWithExtension(true)
+            }
+        }
+    }
+
+    setWithExtension = (value: boolean) => {
+        const canSet = ((this.withBan && value) || !this.withBan
+           || (this.playersCount > 2 && value) || this.playersCount === 2) && this.canEdit
+
+        if (canSet) {
+            this.withExtension = value
+        } 
+    }
+
+    get withBan () {
+        return this.draftStages.includes(DraftStage.ban)
+    }
+
+    deleteStage = (index: number) => {
+        if (this.canEdit) {
+            this.draftStages = this.draftStages.filter((_, i) => i !== index)
+        }
+    }
+
+    get maxPlayersPerTeam () {
+        return Math.ceil(this.playersCount / 2)
+    }
+}
+
+type GameRoomDefaultData = {
+    teams: Team<UserWithReadyStatus>[]
+    props: GameRoomPropsController
+    owner: User
+    saved: boolean
+    blackList: string[]
+    admins: string[]
+}
+
+export class GameRoom extends Stage<any, GameRoomDefaultData, PrevState> {
+    teams: Team<UserWithReadyStatus>[] = []
+    owner: User
+    private api: IGameAPI
+    currentUser: UserWithReadyStatus
+    props: GameRoomPropsController
+    blackList: string[] = []
+    saved: boolean = false
+    private onUserKick: undefined | Function
+    admins: string[] = []
+
+    constructor (controller: IStageController, owner: User, api: IGameAPI, currentUser: User, isBigDaddy: boolean, def?: GameRoomDefaultData) {
+        super(StageCode.room, controller, isBigDaddy, def)
+        this.owner = owner
+        this.api = api
+        const defaultUser = def ? def.teams.map(({ users }) => users).flat().find(({ id }) => id === currentUser.id) : null
+        this.currentUser = defaultUser || new UserWithReadyStatus(currentUser)
+        this.props = new GameRoomPropsController(undefined, this.isOwner)
+        this.api.onChangeReadyStatus(this.applyReadyStatus)
+        this.api.onJoinTeam(this.applyUserJoin)
+        this.api.onLeaveTeam(this.applyUserLeave)
+        this.api.onKickUser(this.applyKickUser)
+        this.api.onChangeAdmins(this.applyAdminsChange)
+
+        const changeReady = () => {
+            let timer: any
+            let startStatus = this.meReady
+
+            return async (status: boolean) => {              
+                try {
+                    this.currentUser.setReady(status)
+                    clearTimeout(timer)
+                    
+                    if (status !== startStatus) {
+                        timer = setTimeout( async () => {
+                            
+                            await this.api.setReadyStatus(status)
+                            console.log(status + 'sdfdsdf')
+                            startStatus = status
+
+                        }, 400)
+                    }
+                } catch (e) {}
+            }
+        }
+
+        this.setReadyStatus = changeReady()
+
+        makeObservable(this, {
+            meReady: computed,
+            teams: observable,
+            blackList: observable,
+            saved: observable,
+            admins: observable,
+            setReadyStatus: action
+        })
+    }
+
+    setOwner = (user: User) => {
+        this.owner = user
+    }
+
+    private getUserByEmail = (email: string) => {
+        return this.users.find((user) => user.email === email)
+    }
+
+    applyAdminsChange = (email: string, reverse: boolean) => {
+        const user = this.getUserByEmail(email)
+
+        if (user) {
+            user.setType(reverse ? UserType.user : UserType.moderator)
+        }
+    }
+
+    saveRoom = async () => {
+       this.saved = true
+       await this.api.saveRoom()
+    }
+
+    undoSaveRoom = async () => {
+        this.saved = false
+        await this.api.undoSaveRoom()
+    }
+
+    toggleRoomSave = () => {
+        if (this.saved) {
+            this.undoSaveRoom()
+        } else {
+            this.saveRoom()
+        }
+    }
+
+    changeAdmins = async (email: string, reverse: boolean) => {
+        await this.api.changeAdmin(email, reverse)
+    }
+
+    get users () {
+        return this.teams.map(user => user.users).flat()
+    }
+
+    applyKickUser = (email: string) => {
+        const user = this.getUserByEmail(email)
+
+        if (user) {
+            NotificationService.getInstance().addNotification({
+                type: NotificationType.info,
+                message: `Пользователь ${user.name} был кикнут из комнаты`
+            })
+
+            this.removeUserByEmail(email)
+
+            if (email === this.currentUser.email) {
+                this.onUserKick && this.onUserKick()
+            }
+        }
+    }
+
+    subscribeOnUserKick = (cb: Function) => {
+        this.onUserKick = cb
+    }
+
+    private removeUserByEmail = (email: string) => {
+        this.teams.forEach(team => {
+            team.users = team.users.filter(user => user.email !== email)
+        })
+    }
+
+    kickUser = async (email: string, withBan = false) => {
+        if (this.isOwner) {
+            const backup = this.teams
+            try {
+                this.removeUserByEmail(email)
+
+                if (withBan) {
+                    this.blackList.push(email)
+                }
+
+                await this.api.kickUser(email, withBan)
+            } catch (e) {
+                this.teams = backup
+            }
+        }
+    }
+
+    undoBan = async (email: string) => {
+        if (this.isOwner) {
+            const backup = this.blackList
+            try {
+                this.blackList = this.blackList.filter(userEmail => userEmail !== email)
+                await this.api.undoBanUser(email)
+            } catch (e) {
+                this.blackList = backup
+            }
+        }
+    }
+
+    applyEditProps = async (data: Partial<ServerRoomPropsPayload>) => {
+        this.props.patchData(data)
+        this.props.updateInitData()
+    }
+
+    applyReadyStatus = (userId: string, status: boolean) => {
+        this.teams.map(team => team.users).flat().find(user => user.id === userId)?.setReady(status)
+    }
+
+    applyUserLeave = (userId: string) => {
+        this.teams = this.teams.map(team => {
+            team.removeUserById(userId)
+            return team
+        })
+    }
+
+    applyUserJoin = (user: ServerUser, teamId: string) => {
+        this.addUserToTeam(UserMapper.toDomain(user), teamId)
+    }
+
+    private startLoading = () => {
+        this.loading = true
+    }
+
+    private stopLoading = () => {
+        this.loading = false
+    }
+
+    editProps = async (data: Partial<ServerRoomPropsPayload>) => {
+        try {
+            this.startLoading()
+            await this.api.editProps(data)
+            this.props.patchData(data)
+            this.props.updateInitData()
+            this.stopLoading()
+        } catch (_) {
+            this.stopLoading()
+            this.props.resetData()
+        }
+    }
+
+    setReadyStatus = async (_: boolean) => {}
+
+    toggleReadyStatus = async () => {
+        await this.setReadyStatus(!this.meReady)
+    }
     
-            await this.action.start().catch(this.interactWithCard)
-        } while (await this.action.start())
-        return
+    get meReady () {
+        return this.currentUser.ready
+    }
+
+    start(): void {    
+        if (this.defaultData) {
+            this.teams = this.defaultData.teams
+            this.props = this.defaultData.props
+            this.owner = this.defaultData.owner
+            this.blackList = this.defaultData.blackList
+            this.saved = this.defaultData.saved
+            this.admins = this.defaultData.admins
+        }  
+    }
+
+    connectToTeam = async (team: Team) => {
+        try {
+            await this.api.joinTeam(team.id)
+            this.addUserToTeam(this.currentUser, team.id)
+        } catch (e) {
+            console.log(e)
+        }
+    }
+
+    addBotToTeam = (team: Team) => {
+        this.addUserToTeam(this.currentUser, team.id)
+    }
+
+    connectToRandomTeam = () => {
+        this.connectToTeam(getRandomElement(this.availableToConnectTeams))
+    }
+
+    leaveTeam = async () => {
+        try {
+            await this.api.leaveTeam()
+            this.teams = this.teams.map(team => {
+                team.removeUserById(this.currentUser.id)
+                return team
+            })
+        } catch (_) {}
+    }
+
+    get canStart() {
+        return this.currentCountOfPlayers === this.props.playersCount
+            && this.teams.every(team => team.users.every(({ ready  }) => ready))
+    }
+
+    checkCanAddUserToTeam = (team: Team<any>) => {
+        return team.users.length < this.props.maxPlayersPerTeam 
+    } 
+
+    addUserToTeam = (user: User, teamId: string) => {
+        const foundTeam = this.teams.find(t => t.id === teamId)
+
+        if (foundTeam && this.checkCanAddUserToTeam(foundTeam!)) {
+            foundTeam.addUser(new UserWithReadyStatus(user))
+        }     
+    }
+
+    formatDataForNextStage = (): PrevState => {
+        return {
+            users: new UsersStorage(this.teams as any, this.currentUser),
+            config: {
+                withExtension: this.props.withExtension,
+                draftTemplates: this.props.draftStages
+            }
+        }
+    }
+
+    get canAddUser() {
+        return this.currentCountOfPlayers < this.props.playersCount
+    }
+
+    get availableToConnectTeams () {
+        return this.teams.filter(this.checkCanAddUserToTeam)
+    }
+
+    get freeTeams () {
+        return this.teams
+    }
+
+    get isConnectedToRoom() {
+        return !!this.myTeam
+    }
+
+    get myTeam() {
+        return this.teams.find(team => team.users.some(user => user.id === this.currentUser.id)) || null
+    }
+
+    get isOwner() {
+        return this.currentUser.id === this.owner.id
+    }
+
+    get currentCountOfPlayers () {
+        return this.teams.reduce((acc, t) => acc + t.playersCount, 0)
     }
 }
 
-type Log = {
-    user: string
-    action: string
-    target: string
-    extra: Log[]
-}
 
-export type GameStageCode = 'DRAFT' | 'GAME' | 'END' | 'ROOM'
-export type State = {
-    turn: string
-    userDecks: Decks 
-    users: {
-        guilds: UserPicks
-        fields: string[][]
-    }[]
-    points: {
-        team: string
-        count: number
-    }[]
-}
-
-interface GameAPI extends ChatAPI {
-    logAction(l: Log): void
-    getLog(): Log
-    setState(state: State): void
-    getState(): State
-    connect(): {
-        stage: GameStageCode
-        turn: string
-        teams: {
-            id: string
-            name: string
-            users: {
-                id: string
-                name: string
-            }[]
-        }[]
-    }
-}
-
-// class GameWebsocketAPI implements GameAPI {
-//     static instance: GameWebsocketAPI
-//     private path = ''
-//     private socket: ReturnType<typeof io>
-
-//     constructor () {
-//         this.socket = io(this.path)
+// export class GameEnd extends Stage<User, InGameStageControllerDefaultData> {
+//     constructor (controller: InGameStageController) {
+//         super( controller)
 //     }
 
-//     static getInstance = () => {
-//         if (!this.instance) {
-//             this.instance = new GameWebsocketAPI()
-//         }
-        
-//         return this.instance
-//     }
-
-
-//     logAction = (l: Log): void => {
+//     start(): void {
         
 //     }
 
-//     getLog(): Log {
-        
+//     restart = () => {
+//         // this.stageController.setGameStage()
 //     }
 
-//     setState(state: State): void {
-        
-//     }
-
-//     getState() {
-        
-//     }
-
-//     connect = () => {
-        
+//     goToRoomMenu = () => {
+//         // this.stageController.setGameStage()
 //     }
 // }
 
-export interface GameStageController {
-    setGameStage(stage: Stage, preloading?: boolean): void
-    syncState(): void
-    stopLoading(): void
-    startLoading(): void
-}
+const START_POINT = 0
 
-export class GameState implements GameStageController {
-    currentStage: Stage | null  = null
-    turn: Turn
-    initialized: boolean = false
-    api: GameAPI | null = null
-    chat: Chat
-    loading: boolean = false
 
-    constructor (teams?: Team[], currentUser?: User | null, api?: GameAPI) {
-        this.turn = new Turn(teams || [], currentUser)
-        this.currentStage = new Draft(this.turn, this)
-        this.currentStage.start()
-        this.api = api || null
-        this.chat = new Chat(api)
+export class Timer {
+    seconds: number
+    private timer: any
+    sideEffect: TimerChangeTimeSideEffect | undefined
+
+    constructor(startSeconds?: number) {
+        this.seconds = startSeconds || START_POINT
         makeAutoObservable(this)
     }
 
-    setApi = (api: GameAPI) => {
-        this.api = api
-        this.chat.setApi(api)
+    setOffsetAccordingStartDate = (date: number) => [
+        this.setOffset(this.seconds + Math.floor((Date.now() - new Date(date).getTime()) * 1000))
+    ]
+
+    setSideEffect = (sideEffect: TimerChangeTimeSideEffect) => {
+        this.sideEffect = sideEffect
     }
+
+    setOffset = (offset: number) => {
+        this.seconds = offset
+    }
+
+    start = () => {
+        this.timer = setInterval(() => {
+            this.seconds += 1
+            this.sideEffect && this.sideEffect(this.seconds)
+        }, 1000)
+    }
+
+    pause = () => {
+        clearInterval(this.timer)
+        this.timer = null
+    }
+
+    reset = () => {
+        this.pause()
+        this.seconds = START_POINT
+    }
+
+    get time () {
+        const minutes = Math.floor(this.seconds / 60)
+        const hours = Math.floor(this.seconds / 3600)
+        const seconds = this.seconds -  hours * 3600 - minutes * 60
+
+        const getTimeValue = (v: number) => v.toString().padStart(2, '0') 
+
+        return [getTimeValue(hours), getTimeValue(minutes), getTimeValue(seconds)].join(':')
+    }
+}
+
+export class Logger {
+    logs: Log[] = []
+    private selectedLog?: string | null = null
+    protected onLogActionEffect: LogSideEffect | null = null
+    protected onAddLogEffect: LogSideEffect | null = null
+    protected enabled: boolean = true
+    protected timer: Timer | null = null
+
+    constructor(timer?: Timer) {
+        this.timer = timer || null
+    }
+
+    setTimer = (timer: Timer | null) => {
+        this.timer = timer
+    }
+
+    setEnabled = (status: boolean) => {
+        this.enabled = status
+    }
+
+    selectLog = (log: Log) => {
+        this.selectedLog = log.id
+    }
+
+    setLogActionSideEffect = (action: LogSideEffect | null) => {
+        this.onLogActionEffect = action
+    }
+
+    setAddLogSideEffect = (action: LogSideEffect | null) => {
+        this.onAddLogEffect = action
+    }
+    
+    logAction = ({ type, action, instigator, target }: LogPayload, sideEffect?: (log: Log) => void) => {
+        if (this.enabled) {            
+            const defaultActionInstigator: LogInstigator = { target: null, type: LogInstigatorType.system }
+
+            const payload: Log = {
+                id: uuid(),
+                type: type || 'util',
+                action,
+                instigator:  instigator || defaultActionInstigator,
+                target: target || null,
+                date: new Date().toLocaleDateString(),
+                timestamp: this.timer ?
+                    { seconds: this.timer.seconds,
+                    UTC: this.timer.time }
+                : undefined,
+                nested: [],
+            }
+
+            this.addLog(payload, this.selectedLog, false)
+            this.logs.push(payload)
+            
+            if (sideEffect) {
+                sideEffect(payload)
+            } else if (this.onLogActionEffect) {
+                this.onLogActionEffect(payload)
+            } 
+        }
+    }
+
+    addLog = (log: Log, toLog?: string | null, ignoreSideEffect?: boolean) => {
+        if (this.onAddLogEffect && !ignoreSideEffect) {
+            this.onAddLogEffect(log)
+        }
+
+        if (toLog) {
+            this.logs.find(log => log.id === toLog)?.nested.push(log)
+        } else {
+            this.logs.push(log)
+        }
+    }
+
+    setLogs = (logs: Log[]) => {
+        this.logs = logs
+    }   
+}
+
+
+abstract class Bot extends User {
+    private stageController: InGameStageController | undefined
+    private enabled: boolean = true
+    
+    constructor(id: string, name: string) {
+        super(id, name, '', null, 0, UserType.bot)
+    }
+
+    setEnabled = (status: boolean) => {
+        this.enabled = status
+    }
+
+    setStageController = (controller: InGameStageController) => {
+        this.stageController = controller
+    }
+
+    move = () => {
+        if (this.enabled && this.stageController) {
+            if (this.stageController.getStage().code === InGameCode.draft) {
+                this.moveInDraftStage(new DraftFacade(this.stageController.getStage() as Draft))
+            }
+    
+            if (this.stageController.getStage().code === InGameCode.process) {
+                this.moveInGameProcessStage(new GameProcessFacade(this.stageController.getStage() as GameProcess))
+            }
+        }
+    }
+
+    protected abstract moveInDraftStage(stage: DraftFacade): void
+    protected abstract moveInGameProcessStage(stage: GameProcessFacade): void
+}
+
+export class FoolishBot extends Bot {
+    constructor(name?: string) {
+        super(uuid(), name || 'Fool')
+    }
+
+    protected moveInGameProcessStage = (stage: GameProcessFacade) => {
+        const spawn = () => {
+            let fieldsForStartSpawn: Field[] = []
+
+            stage.getCurrentTurnUserFields().forEach(fields => {
+                if (fields.length === 1) {
+                    fieldsForStartSpawn.push(fields[0])
+                }
+            })
+            
+            if (fieldsForStartSpawn.length > 0) {
+                getRandomElement(fieldsForStartSpawn).select()
+            } else {
+                stage.selectRandomField()
+            }
+
+            const availableElementalsForSpawn = stage.getCurrentTurnAvailableCards().length
+
+            for (let i = 1; i < Math.min(availableElementalsForSpawn, MAX_SPAWN_ITERATION); i++) {
+                stage.selectRandomCard()
+                selectFieldsUnitActionIndexChanged()
+            }
+        }
+
+        const activate = () => {
+            const availableElementalsForActivation = stage.getAvailableFields().length
+
+            for (let i = 0; i < Math.min(availableElementalsForActivation, MAX_ACTIVATION_ITERATION); i++) {
+               selectFieldsUnitActionIndexChanged()
+            }
+        }
+
+        if (stage.getCurrentTurnHandCards().length === 0) {
+            return stage.draw()
+        }
+
+        const availableActions: Function[] = []
+
+        const addAction = (action: Function, priority: number = 1) => {
+            for (let i = 0; i < priority; i++) {
+                availableActions.push(action)
+            }
+        }
+
+        const countPointsForDraw = stage.getCountPointsForDraw() 
+
+        if (countPointsForDraw > 0) {
+            addAction(stage.draw, countPointsForDraw >= 2 ? 10 : 2)
+        }
+
+        const data = new Map<MobData, { guild: number, value: number }>()
+        const hand = stage.getCurrentTurnHandCards()
+
+        hand.forEach(card => {
+            data.set(card.mobData, this.getCountOfElementalsByGuildAndValue(stage, card.mobData))
+        })
+        
+        hand.forEach(card => {
+            const activateByGuild = () => {
+                stage.activateCardByCode(card.mobData.code, 'guild')
+                activate()
+            }
+            const activateByValue = () => {
+                stage.activateCardByCode(card.mobData.code, 'value')
+                activate()
+            }
+            
+            const stat = data.get(card.mobData)
+
+            if (stat!.guild > 0) {
+                addAction(activateByGuild, 2)
+            }
+
+            if (stat!.value > 0) {
+                addAction(activateByValue, 2)
+            }
+        })
+        
+        hand.forEach(card => {
+            const spawnByGuild = () => {
+                stage.spawnCardByCode(card.mobData.code, 'guild')
+                spawn()
+            }
+            const spawnByValue = () => {
+                stage.spawnCardByCode(card.mobData.code, 'value')
+                spawn()
+            }
+
+            addAction(spawnByValue)
+            addAction(spawnByGuild)
+        })
+
+        getRandomElement(shuffleArray(availableActions))()
+
+        const stopTurn = () => {
+            if (Math.random() > 0.85) {
+                stage.stopTurn()
+            }
+        }
+
+        const selectFieldsUnitActionIndexChanged = () => {
+            const currentIndex = stage.getSequentialActionIterationIndex()
+            stage.selectRandomField()
+
+            while (stage.getSequentialActionIterationIndex() === currentIndex && stage.getAvailableFields().length > 0) {
+                stage.selectRandomField()
+            }
+
+            stopTurn()
+        }
+    }
+
+    private getCountOfElementalsByGuildAndValue = (stage: GameProcessFacade, data: MobData) => {
+        const stat = { guild: 0, value: 0 }
+
+        stage.getCurrentTurnUserFields().forEach(fields => {
+            fields.forEach(field => {
+                if (field.elemental) {
+                    if (field.elemental.mobData.guild.code === data.guild.code) {
+                        stat.guild += 1
+                    }
+
+                    if (field.elemental.mobData.value === data.value) {
+                        stat.value += 1
+                    }
+                }
+            })
+        })
+
+        return stat
+    }
+
+    protected moveInDraftStage = (stage: DraftFacade) => {
+        stage.takeRandomGuild()
+    }
+}
+
+
+abstract class GameAPI implements IGameAPI {
+    protected roomId: string
+    protected callbacks: Record<string, Function[]> = {}
+    private loadings: Record<string, boolean> = {} 
+
+    constructor(roomId: string) {
+        this.roomId = roomId
+    }
+    abstract getGameState(): Promise<Pick<ServerGameState, 'logs' | 'teams' | 'guilds'>>
+    
+    protected setLoading = (key: string, status: boolean) => {
+        this.loadings[key] = status
+    }
+
+    getLoadings = (key: string) => {
+        return this.loadings[key] || false
+    }
+
+    protected saveCallback = (key: string, callback: Function) => {
+        this.callbacks[key] = (this.callbacks[key] || [])
+        this.callbacks[key].push(callback)
+    }
+
+    protected callAllCallbacks = (key: string, args: any) => {
+        this.callbacks[key]?.forEach(cb => cb(...args))
+    }
+
+    abstract changeAdmin(email: string, reverse: boolean): Promise<void>
+    abstract onChangeAdmins(cb: (email: string, reverse: boolean) => void): void
+    abstract saveRoom(): Promise<void>
+    abstract undoSaveRoom(): Promise<void>
+    abstract onKickUser(cb: (userId: string) => void): void
+    abstract undoBanUser(userId: string): Promise<void>
+    abstract kickUser(userId: string, withBan: boolean): Promise<void>
+    abstract onChangeReadyStatus(cb: (userId: string, status: boolean) => void): void
+    abstract onEditProps(cb: (data: Partial<ServerRoomPropsPayload>) => void): void
+    abstract onJoinTeam(cb: (user: ServerUser, teamId: string) => void): void
+    abstract onLeaveTeam(cb: (userId: string) => void): void
+    abstract joinTeam(teamId: string): Promise<void>
+    abstract leaveTeam(): Promise<void>
+    abstract setReadyStatus(status: boolean): Promise<void>
+    abstract onGameStateChange(cb: (data: Pick<ServerGameState, 'logs' | 'teams' | 'guilds'>) => void): void
+    abstract pause(payload: { initiatorId: string } & { paused: boolean; periodStart: number; currentDuration: number }): Promise<void>
+    abstract onPause(cb: (data: { initiatorId: string } & { paused: boolean; periodStart: number; currentDuration: number }) => void): void
+    abstract getState(): Promise<ServerFinalState> 
+    abstract setGameState(state: GameStatePayload): Promise<void>
+    abstract connect(userId: string, cb: () => void): Promise<void> 
+    abstract startStage(stage: InGameCode, payload: GameStatePayload): Promise<void> 
+    abstract onStartStage(cb: (data: ServerFinalState) => void): void
+    abstract disconnect(cb: () => void): Promise<void>
+    abstract sendLog(log: Log): void 
+    abstract getLog(cb: (log: Log) => void): void 
+    abstract editProps(state: Partial<ServerRoomPropsPayload>): Promise<void>
+}
+
+type WebsocketResponse = { 
+    message: string
+    status: string
+}
+
+export class WebSocketGameAPI extends GameAPI {
+    socket: any
+    api: HTTPAxiosAPI 
+
+    constructor(roomId: string) {
+        super(roomId)
+        this.api = new HTTPAxiosAPI(`/rooms/${this.roomId}`)
+    }
+
+    private operateError = (err: WebsocketResponse) => {
+        if (err) {
+            
+        }
+    }
+
+    private throwError = (err: WebsocketResponse, reject: (err: Error) => void) => {
+        if (err.status === 'error') {
+            reject(new Error(err.message))
+        }
+    }
+
+    
+
+    pause = (_: { initiatorId: string } & { paused: boolean; periodStart: number; currentDuration: number }): Promise<void> => {
+        return new Promise((res, rej) => {
+            this.socket.emit(WEBSOCKET_EVENTS.togglePause, this.operateResponse(res, rej))
+        })
+    }
+
+    onGameStateChange(_: (data: Pick<ServerGameState, 'logs' | 'teams' | 'guilds'>) => void): void {
+        
+    }
+
+    onPause(_: (data: { initiatorId: string } & { paused: boolean; periodStart: number; currentDuration: number }) => void): void {
+        
+    }
+
+
+
+    setGameState = async (payload: GameStatePayload): Promise<void> => {
+        await this.api.post('/game-state', payload)
+    }
+
+    getGameState = async () => {
+        const data = await this.api.get<RedisState['gameState']>('/game-state')
+
+        if (data) {
+            return data
+        }
+
+        throw new Error()
+    }
+
+    private transformServerRedisStateToFinal = (data: RedisState): ServerFinalState => {
+        const isInGameStage = [InGameCode.process, InGameCode.draft].includes(data.stage as InGameCode)
+
+        return {
+            ...data.generalState,
+            stage: isInGameStage ? StageCode.game : data.stage as StageCode,
+            roomState: data.roomState,
+            teams: data.gameState.teams,
+            game: {
+                ...data.gameState,
+                ...data.time,
+                stage: data.stage as InGameCode,
+
+            }
+        }
+    }
+
+    getState = async () => {
+        const data = await this.api.get<RedisState>('')
+      
+        if (data) {
+            return this.transformServerRedisStateToFinal(data)
+        }
+        
+        throw new Error('PRIVATE')
+    }
+
+    private onWebsocketEvent = (key: WebsocketEvents) => {
+        this.socket.on(key, (...args: any[]) => {
+            this.callAllCallbacks(key, args)
+        })
+    }
+
+    connect = (userId: string, cb: () => void): Promise<void> => {
+        return new Promise((res) => {
+            this.socket = io(WEBSOCKET_SERVER_PATH, {
+                auth: {
+                    token: userId,
+                    room: this.roomId
+                }
+            })
+            this.socket.on(WEBSOCKET_EVENTS.connect, cb)
+            this.onWebsocketEvent(WEBSOCKET_EVENTS.kick)
+            this.onWebsocketEvent(WEBSOCKET_EVENTS.logAction)
+            this.onWebsocketEvent(WEBSOCKET_EVENTS.startStage)
+            this.onWebsocketEvent(WEBSOCKET_EVENTS.changeReadyStatus)
+            this.onWebsocketEvent(WEBSOCKET_EVENTS.editRoomProps)
+            this.onWebsocketEvent(WEBSOCKET_EVENTS.leaveTeam)
+            this.onWebsocketEvent(WEBSOCKET_EVENTS.joinTeam)
+            this.socket.on(WEBSOCKET_EVENTS.startStage, (data: RedisState) => {
+                this.callAllCallbacks(WEBSOCKET_EVENTS.startStage, this.transformServerRedisStateToFinal(data))
+            })
+            res()
+        })
+       
+    }
+
+    joinTeam = (teamId: string): Promise<void> => {
+        return new Promise((resolve, rej) => {
+            this.setLoading(WEBSOCKET_EVENTS.joinTeam, true)
+            this.socket.emit(WEBSOCKET_EVENTS.joinTeam, teamId, (res: WebsocketResponse) => {
+                this.setLoading(WEBSOCKET_EVENTS.joinTeam, false)
+                this.throwError(res, rej)
+                resolve()
+            })
+        })
+       
+    }
+
+    changeAdmin = async (email: string, reverse = false): Promise<void> => {
+        return new Promise((res, rej) => {
+            this.socket.emit(WEBSOCKET_EVENTS.changeAdmins, email, reverse, this.operateResponse(res, rej))
+        })
+    }
+
+    saveRoom = async (): Promise<void> => {
+       await this.api.get('/save')
+    }
+
+    undoSaveRoom = async (): Promise<void> => {
+        await this.api.delete('/save')
+    }
+
+    onChangeAdmins = (cb: (email: string, reverse: boolean) => void): void => {
+        this.saveCallback(WEBSOCKET_EVENTS.changeReadyStatus, cb)
+    }
+
+    kickUser = (email: string, withBan: boolean): Promise<void> => {
+        return new Promise((res, rej) => {
+            this.socket.emit(WEBSOCKET_EVENTS.kick, email, withBan, this.operateResponse(res, rej))
+        })
+    }
+
+    undoBanUser = async (userEmail: string): Promise<void> => {
+        try {
+            await this.api.delete(`/blacklist/${userEmail}`)
+        } catch (e) {
+            NotificationService.getInstance().addNotification({ type: NotificationType.system, variant: NotificationVariant.error, message: 'Не удалось заблокировать пользователя' })
+            throw e
+        }
+    }
+
+    private operateResponse = (res: Function, rej: (err: Error) => void) => (response: WebsocketResponse) => {
+        this.throwError(response, rej)
+        res()
+    } 
+
+    leaveTeam = (): Promise<void> => {
+        return new Promise((res, rej) => {
+            this.socket.emit(WEBSOCKET_EVENTS.leaveTeam, this.operateResponse(res, rej))
+        })
+    }
+
+    setReadyStatus(value: boolean): Promise<void> {
+        return new Promise((res, rej) => {
+            this.socket.emit(WEBSOCKET_EVENTS.changeReadyStatus, value, this.operateResponse(res, rej))
+        })
+    }
+
+    startStage = (stage: InGameCode, data: GameStatePayload): Promise<void> => {
+        return new Promise((res, rej) => {
+            this.socket.emit(WEBSOCKET_EVENTS.startStage, stage, data, this.operateResponse(res, rej))
+        })
+       
+    }
+
+    onStartStage = (cb: (data: ServerFinalState) => void): void => {
+        this.saveCallback(WEBSOCKET_EVENTS.startStage, cb)
+    }
+
+    onKickUser(cb: (userId: string) => void): void {
+        this.saveCallback(WEBSOCKET_EVENTS.kick, cb)
+    }
+
+    onChangeReadyStatus = (cb: (userId: string, status: boolean) => void): void => {
+        this.saveCallback(WEBSOCKET_EVENTS.changeReadyStatus, cb)
+    }
+
+    onEditProps = (cb: (data: Partial<ServerRoomPropsPayload>) => void): void => {
+        this.saveCallback(WEBSOCKET_EVENTS.editRoomProps, cb)
+    }
+
+    onJoinTeam = (cb: (user: ServerUser, teamId: string) => void): void => {
+        this.saveCallback(WEBSOCKET_EVENTS.joinTeam, cb)
+    }
+
+    onLeaveTeam(cb: (userId: string) => void): void {
+        this.saveCallback(WEBSOCKET_EVENTS.leaveTeam, cb)
+    }
+
+    disconnect = (cb: () => void): Promise<void> => {
+        return new Promise((res) => {
+            this.socket.on(WEBSOCKET_EVENTS.disconnect, () => {
+                cb()
+                res()
+            })
+            this.socket.disconnect()
+        })
+    }
+
+    sendLog = (log: Log): void => {
+        this.socket.emit(WEBSOCKET_EVENTS.logAction, log, this.operateError)
+    }
+
+    getLog = (cb: (log: Log) => void): void => {
+        this.saveCallback(WEBSOCKET_EVENTS.logAction, cb)
+    }
+
+    editProps = async (payload: Partial<ServerRoomPropsPayload>): Promise<void> => {
+        this.socket.emit(WEBSOCKET_EVENTS.editRoomProps, payload, this.operateError)
+    }
+}
+
+
+// export class LocalGameApi extends GameAPI {
+//     getGameState = async () => {
+//         const state = this.getLSState()
+//         return {
+//             teams: state.teams,
+//             logs: state.game.logs,
+//             guilds: state.game.guilds
+//         }
+//     }
+
+//     pause(payload: { initiatorId: string } & { paused: boolean; periodStart: number; currentDuration: number }): void {
+        
+//     }
+
+//     onPause(cb: (data: { initiatorId: string } & { paused: boolean; periodStart: number; currentDuration: number }) => void): void {
+        
+//     }
+
+//     onGameStateChange(cb: (data: Pick<ServerGameState, 'logs' | 'teams' | 'guilds'>) => void): void {
+        
+//     }
+
+//     private lsKey = `riftforce_currentgame_${this.roomId}`
+
+//     private getLSState = (): ServerFinalState => {
+//         const data = localStorage.getItem(this.lsKey)
+//         return data ? JSON.parse(data) as ServerFinalState : EMPTY_SERVER_FINAL_STATE
+//     }
+
+//     private setLSState = (state: ServerFinalState) => {
+//         localStorage.setItem(this.lsKey, JSON.stringify(state))
+//     }
+
+//     setState = async (state: Partial<ServerFinalState>): Promise<void> => {
+//         this.setLSState({ ...this.getLSState(), ...state })
+//     }
+//     getState = async (): Promise<ServerFinalState> => {
+//         return this.getLSState()
+//     }
+//     getRoomState = async (): Promise<ServerRoomState> => {
+//         const state = this.getLSState()
+//         return {
+//             ...state.roomState,
+//             teams: state.teams
+//         }
+//     }
+//     setRoomState = async ({ teams, ...state }: ServerRoomState): Promise<void> => {
+//         const prevState = this.getLSState()
+//         this.setLSState({
+//              ...prevState,
+//              roomState: state,
+//              teams: prevState.teams.map((team, i) => ({
+//                 ...team,
+//                 users: team.users.map((user, j) => ({
+//                     ...user,
+//                     ...teams[i].users[j]
+//                 }))
+//              }))
+//         })
+//     }
+  
+//     setGameState = async ({ teams, ...state }: GameStatePayload): Promise<void> => {
+//         const prevState = this.getLSState()
+//         this.setLSState({
+//              ...prevState,
+//              game: {
+//                 ...prevState.game,
+//                 ...state
+//              },
+//              teams: prevState.teams.map((team, i) => ({
+//                 ...team,
+//                 users: team.users.map((user, j) => ({
+//                     ...user,
+//                     ...teams[i].users[j]
+//                 }))
+//              }))
+//         })
+//     }
+//     connect(){}
+//     startStage(){}
+//     getStartedStage(){}
+//     disconnect(){}
+//     sendLog(){}
+//     getLog(){}
+
+//     editProps = async ({ password, type, ...props }: Partial<ServerRoomPropsPayload>): Promise<void> => {
+//         const prevState = this.getLSState()
+//         this.setLSState({
+//             ...prevState,
+//             roomState: {
+//                 ...prevState.roomState,
+//                 password: password || prevState.roomState.password,
+//                 type: type || prevState.roomState.type,
+//                 props: {
+//                     ...prevState.roomState.props,
+//                     ...props
+//                 }
+//             }
+//         })
+//     }
+// }
+
+export class GameState implements IStageController {
+    currentStage: Stage | null  = null
+    initialized: boolean = false
+    api: IGameAPI
+    // chat: Chat
+    loading: boolean = false
+    currentUser: User
+    defaultState: ServerFinalState | undefined
+    type: GameType
+
+    constructor (sessionId: string, type: GameType, currentUser?: User | null) {
+        this.type = type
+        this.api = new WebSocketGameAPI(sessionId)
+        // this.chat = new Chat(api)
+        this.currentUser = currentUser || new User('guest', 'Гость', 'none', null)
+        makeAutoObservable(this)
+    }
+
+    setApi = (api: IGameAPI) => {
+        this.api = api
+        // this.chat.setApi(api)
+    }
+
     stopLoading(): void {
         this.loading = false
     }
 
-    startLoading(): void {
-        this.loading = true
+    getState = async () => {
+        
     }
 
     setGameStage = (stage: Stage, preloading?: boolean) => {
@@ -2586,73 +4327,602 @@ export class GameState implements GameStageController {
         this.initialized = true
     }
 
-    syncState() {
-
+    getStage(): Stage<object, unknown, object> {
+        return this.currentStage!
     }
 
-    onConnect() {
-         
+    setStage(stage: Stage<object, unknown, object>): void {
+        this.currentStage = stage
     }
 
-    onReconnect() {
+    private applyDefault = (data: ServerFinalState) => {
+        const { bigDaddy, teams, roomState, owner, game, stage } = data
+ 
+            const isBigDaddy = this.currentUser?.id === bigDaddy
+            const gameStage = new InGameStageController(this, isBigDaddy)
+            const ownerData = teams.map(t => t.users).flat().find(u => u.id === owner)!
+            const roomOwner = UserMapper.toDomain(ownerData)
+    
+            const roomDefault: GameRoomDefaultData = {
+                owner: roomOwner,
+                saved: roomState.saved,
+                props: GameRoomPropsMapper.toDomain(roomState),
+                teams: teams.map(RoomTeamMapper.toDomain),
+                blackList: roomState.blackList,
+                admins: roomState.administrators,
+            }
 
+            roomDefault.teams.forEach(team => {
+                team.users.forEach(({ email, setType }) => {
+                    if (roomState.administrators.includes(email)) {
+                        setType(UserType.moderator)
+                    }
+                })
+            })
+
+            const gameDefaultData: InGameStageControllerDefaultData = {
+                ...game,
+                teams,
+                currentUser: this.currentUser
+            }
+
+            switch (stage) {
+                case StageCode.room:
+                    const gameRoom = new GameRoom(this, roomOwner, this.api, this.currentUser, isBigDaddy, roomDefault)
+                    gameRoom.setNext(gameStage)
+                    this.setStage(gameRoom)
+                    break
+                case StageCode.game:
+                    gameStage.setDefaultData(gameDefaultData)
+                    this.setStage(gameStage)
+                    break
+            }   
+            this.getStage().start()
     }
 
-    onDisconnect() {
+    start = async (data?: PrevState, onDeniAccess?: Function) => {
+        if (data && this.type === GameType.local) {
+            const gameStage = new InGameStageController(this, true)
+            this.setStage(gameStage)
+            gameStage.start(data)
+        } else {
+            try {
+                const state = await this.api?.getState() 
+                this.applyDefault(state)
 
+                this.api.onStartStage((data) => {
+                    this.applyDefault(data)
+                })
+            
+                if (this.currentUser) {
+                    this.api?.connect(this.currentUser.id, () => {})
+                }
+            } catch (e: any) {
+                if (e.message === 'PRIVATE') {
+                    onDeniAccess && onDeniAccess()
+                }
+            }
+        }
+    }
+    
+    stop() {
+        this.api
+    }
+}
+
+interface IService {
+    stop(): void
+}
+interface IServiceWithCurrentUser extends IService {
+    currentUser: User | null
+}
+
+
+export class ServiceWrapper<T extends IService> {
+    service: T | null = null
+
+    setService = (service: T) => {
+        this.service = service
+    }
+
+    clearService = () => {
+        this.service?.stop()
+        this.service = null
+    }
+}
+
+export class WithCurrentUserServiceWrapper<T extends IServiceWithCurrentUser> {
+    service: T | null = null
+    authService: AuthUserController 
+
+    constructor(authService: AuthUserController) {
+        this.authService = authService
+        makeObservable(this, {
+            service: observable,
+            setService: action,
+            clearService: action
+        })
+    }
+
+    setService = (cb:( (currentUser: User) =>  T)): Promise<T> => {
+        return new Promise((res, rej) => {
+            if (this.authService.user) {
+                this.service = cb(this.authService.user)
+                res(this.service as T)
+            }
+
+            rej()
+        })
+    }
+
+    clearService = () => {
+        this.service?.stop()
+        this.service = null
+    }
+}
+
+export class BaseInGameControllerDecorator  implements IInGameStageController {
+    private controller: IInGameStageController
+    
+    constructor(controller: IInGameStageController) {
+        this.controller = controller
+    }
+
+    processAddingLog = (log: Log): void => {
+        this.controller.processAddingLog(log)
+    }
+
+    processLoggingAction = (log: Log): void => {
+        this.controller.processLoggingAction(log)
+    }
+
+    getEntityState = () => {
+        return this.controller.getEntityState()
+    }
+
+    setStage = (stage: InGameStage<unknown, unknown>): void => {
+        this.controller.setStage(stage)
+    }
+
+    getLogger = (): Logger => {
+        return this.controller.getLogger()
+    }
+
+    getTurnController = (): Turn  => {
+        return this.controller.getTurnController()
+    }
+
+    getTimer = (): Timer => {
+        return this.controller.getTimer()
+    }
+
+    getPauseStatus = (): boolean => {
+        return this.controller.getPauseStatus()
+    }
+
+    processUserTurn = (user: User) => {
+        this.controller.processUserTurn(user)
+    }
+
+    start = (): void  =>{
+        this.controller.start()
+    }
+
+    stop = () => {
+        this.controller.stop()
+    }
+
+    enableBots = (status: boolean): void => {
+        this.controller.enableBots(status)
+    }
+
+    setTimer(timer: Timer): void {
+        this.controller.setTimer(timer)
+    }
+
+    setLogger(logger: Logger): void {
+        this.controller.setLogger(logger)
+    }
+
+    getStage =() => {
+        return this.controller.getStage()
+    }
+
+    pause = () => {
+        this.controller.pause()
+    }
+
+    unpause = (): void => {
+        this.controller.unpause()
     }
 }
 
 
-// interface Syncronizer {
-//     syncServerWithLocal(): void
-//     syncLocalWithServer(): void
-// }
+export class SyncronizedInGameStageControllerDecorator extends BaseInGameControllerDecorator {
+    private updater: InGameStageUpdater<any>
+    private api: ISyncGameAPI
 
-// class DraftSyncronizer implements Syncronizer {
-//     syncLocalWithServer(): void {
-        
-//     }
+    constructor(controller: IInGameStageController, api: ISyncGameAPI) {
+        super(controller)
+        const stage = controller.getStage()
+        this.api = api
+        this.updater = new DraftUpdater(stage as Draft)
+        this.api.onGameStateChange(state => {
+            this.updater.updateAllState(state)
+        })
+    }
 
-//     syncServerWithLocal(): void {
-        
-//     }
-// }
+    private setUpdater = (stage: InGameStage) => {
+        switch(stage.code) {
+            case InGameCode.draft:
+                this.updater = new DraftUpdater(stage as Draft)
+                break
+            case InGameCode.process:
+                this.updater = new GameProcessUpdater(stage as GameProcess)
+                break
+            default:
+                this.updater = new DraftUpdater(stage as Draft)
+        }
+    }
 
-// class EndSyncronizer implements Syncronizer {
-//     syncLocalWithServer(): void {
-        
-//     }
+    pause = () => {
+        super.pause()
+    }
 
-//     syncServerWithLocal(): void {
-        
-//     }
-// }
+    unpause = (): void => {
+        super.unpause()
+    }
 
-// class GameProcessSyncronizer implements Syncronizer {
-//     syncLocalWithServer(): void {
-        
-//     }
+    setStage = (stage: InGameStage) => {
+        super.setStage(stage)
+        this.setUpdater(stage)
+    }
 
-//     syncServerWithLocal(): void {
-        
-//     }
-// }
+    processLoggingAction = (log: Log) => {
+        super.processLoggingAction(log)
 
-interface ChatController {
-    deleteMessage(m: Message): void
-    deleteMessageLocally(me: Message): void
-    editMessage(m: Message): void
-    repeatMessageRequest(m: Message): void
+        const logActionsForSync: string[] = [LOG_ACTIONS.switch_turn, LOG_ACTIONS.start_action_iteration]
+
+        if (logActionsForSync.includes(log.action)) {
+            this.api.setGameState(this.getEntityState())
+        } 
+    }
 }
 
-export interface ChatAPI {
-    sendChatMessage(m: Message): Promise<void>
-    editChatMessage(m: Message):  Promise<void>
-    deleteChatMessage(m: Message):  Promise<void>
-    getLastMessage(): Promise<Message>
-    getMessages(): Promise<Message[]>
+
+export class LogSyncrnoziedInGameStageControllerDecorator extends BaseInGameControllerDecorator {
+    logReader: LogReader
+    access: User | null = null
+    api: ILoggingGameAPI
+    
+    constructor(controller: IInGameStageController, api: ILoggingGameAPI) {
+        super(controller)
+        const stage = controller.getStage()
+        this.logReader =  new DraftLogReader(stage as Draft)
+        this.api = api
+        this.setLogReader(stage)
+        this.api.getLog(this.applyServerLog)
+        this.setAccess(this.getTurnController().currentTurn)
+    }
+
+    private applyServerLog = (log: Log) => {
+        this.getLogger().addLog(log)
+        this.processLog(log)
+    }
+
+    private setLogReader = (stage: InGameStage) => {
+        switch(stage.code) {
+            case InGameCode.draft:
+                this.logReader = new DraftLogReader(stage as Draft)
+                break
+            case InGameCode.process:
+                this.logReader = new GameProcessLogReader(stage as GameProcess)
+                break
+            default:
+                this.logReader = new DraftLogReader(stage as Draft)
+        }
+    }
+
+    setAccess = (access: User | null) => {
+        this.access = access
+    }
+
+    processLog = (log: Log) => {
+        const canProcess = this.access
+            ? log.instigator.type === LogInstigatorType.user
+                ? log.instigator.target === this.access.id
+                : true
+            : true
+
+        if (canProcess) {
+            this.logReader.readLog(log)
+        }     
+    }
+
+    processLoggingAction = (log: Log) => {
+        super.processLoggingAction(log)
+
+        if (log.action === LOG_ACTIONS.switch_turn) {
+            this.setAccess(this.getTurnController().currentTurn)
+        }
+
+        this.api.sendLog(log)
+    }
 }
+
+
+
+export class InGameStageController extends Stage<PrevState, InGameStageControllerDefaultData> implements IInGameStageController {
+    stage: InGameStage | null = null
+    private logger: Logger = new Logger()
+    private timer: Timer = new Timer()
+    private turn: Turn = new Turn([])
+    private paused: boolean = false
+    private initialized: boolean = false
+
+    constructor(controller: IStageController, isBigDaddy: boolean, defaultData?: InGameStageControllerDefaultData) {
+        super(StageCode.game, controller, isBigDaddy, defaultData)
+        this.setLogger(this.logger)
+        makeObservable(this, {
+            'stage': observable,
+            'setStage': action
+        })
+    }
+
+    getEntityState = (): GameStatePayload => {
+        const controller = this
+        const guilds = controller.getStage().code === InGameCode.draft ? GuildsPoolMapper.toEntity((controller.getStage() as Draft).guilds) : []
+
+        const feilds = controller.getStage().code === InGameCode.process
+            ?  FieldsControllerMapper.toEntity((controller.getStage() as GameProcess).gameField)
+            : new Map()
+        
+        const emptyDeck: ServerUserDecks = {
+            left: [],
+            hand: [],
+            deck: []
+        }
+
+        const emptyDraft: ServerUserPicks = {
+            picks: [],
+            bans: []
+        }
+
+        return {
+            teams: controller.getTurnController().teams.map(team => ({
+                id: team.id,
+                points: controller.getStage().code === InGameCode.process
+                    ? (controller.getStage() as GameProcess).points.points.get(team)!
+                    : 0,
+                name: team.name || '',
+                users: team.users.map(user => ({
+                    id: user.id,
+                    name: user.name,
+                    email: user.email,
+                    avatar: user.avatar,
+                    rating: user.rating,
+                    fields: controller.getStage().code === InGameCode.process
+                        ? feilds.get(user)!
+                        : [],
+                    draft: controller.getStage().code === InGameCode.draft
+                        ? UserDraftMapper.toEntity((controller.getStage() as Draft).usersDraft.get(user)!)
+                        : emptyDraft,
+                    cards: controller.getStage().code === InGameCode.process
+                        ? CardsControllerMapper.toEntity((controller.getStage() as GameProcess).usersCards.get(user)!)
+                        : emptyDeck,
+                }))
+            })),
+            guilds
+        }
+    }
+
+    getTimer = (): Timer => {
+        return this.timer
+    }
+
+    getLogger = () => {
+        return this.logger
+    }
+
+    getTurnController = () => {
+        return this.turn
+    }
+
+    getStage = () => {
+        return this.stage!
+    }
+
+    getPauseStatus = () => {
+        return this.paused
+    }
+
+    setStage = (stage: InGameStage) => {
+        this.stage = stage
+    }
+
+    setTimer = (timer: Timer) => {
+        if (!this.initialized) {
+            this.timer = timer
+        }
+    }
+
+    processUserTurn = (user: User): void => {
+        if (user.type === UserType.bot && user instanceof Bot) {
+            user.move()
+        }
+    }
+
+    processAddingLog = (_: Log) => {}
+    processLoggingAction = (_: Log) => {}
+
+    private configureAllBots = () => {
+        if (this.turn) {
+            this.turn.usersOrder.forEach(([user]) => {
+                if (user.type === UserType.bot && user instanceof Bot) {
+                    user.setStageController(this)
+                }
+            })
+        }
+    }
+
+    private createGameProcessInstance = (def?: DefaultProcessGameState) => {
+        return new GameProcess(this.turn, this, this.isBigDaddy, this.logAction, def)
+    }
+
+    private createDraftInstance = (def?: DefaultPicks) => {
+       return new Draft(this.turn, this, this.isBigDaddy, this.logAction, def)
+    }
+
+    start = (prev?: PrevState) => {
+        this.initialized = true
+        this.getStage()?.setLogAction(this.logAction)
+
+        if (this.defaultData) { 
+            const gameProcessDefaultData: DefaultProcessGameState = {
+                points: new Map(),
+                fields: new Map(),
+                cards: new Map()
+            }
+
+            const draftDefaultData: DefaultPicks = {
+                total: this.defaultData.guilds,
+                users: new Map()
+            }
+
+            const teams = this.defaultData.teams.map(( { id, name, users, points } ) => {
+                const team = new Team(id, users.map(({ fields, cards, draft, ...data }) => {
+                    const user = UserMapper.toDomain(data)
+
+                    gameProcessDefaultData.fields.set(user, fields)
+                    gameProcessDefaultData.cards.set(user, cards)
+                    draftDefaultData.users.set(user, draft)
+
+                    return user
+                }) , name)
+                gameProcessDefaultData.points.set(team, points)
+
+                return team
+            })
+
+            this.turn = new Turn(teams , this.defaultData.currentUser)
+            this.turn.setNextTurnSideEffect(this.processUserTurn)
+
+            this.configureAllBots()
+            this.logger.setLogs(this.defaultData.logs)
+
+            const gameProcess = this.createGameProcessInstance(gameProcessDefaultData)
+
+            this.timer.setOffset(this.defaultData.currentDuration)
+            this.timer.setOffsetAccordingStartDate(this.defaultData.periodStart)
+
+            if (this.defaultData.stage === InGameCode.draft) {
+                const draft = this.createDraftInstance(draftDefaultData)
+                draft.setNext(gameProcess)
+                this.setStage(draft)
+            } else {
+                this.setStage(gameProcess)
+            }
+
+            this.getStage().start()
+
+            if (this.defaultData.paused) {
+                this.pause()
+            }
+        } else if (prev) {
+            this.turn = new Turn(prev.users.teams, prev.users.currentUser)
+            this.turn.setNextTurnSideEffect(this.processUserTurn)
+            this.configureAllBots()
+            const draft = this.createDraftInstance()
+            draft.setNext(this.createGameProcessInstance())
+            this.setStage(draft)
+            this.getStage().start(prev.config)
+        }
+    }
+
+    pause = () => {
+        this.paused = true
+        this.timer.pause()
+        this.getStage().setEnabled(false)
+    }
+
+    unpause = () => {
+        this.paused = false
+        this.timer.start()
+        this.getStage().setEnabled(true)
+    }
+
+    setLogger = (logger: Logger) => {
+        if (!this.initialized) {
+            this.logger = logger
+            this.logger.setAddLogSideEffect(this.processLoggingAction)
+            this.logger.setTimer(this.timer)  
+        }
+    }
+
+    logAction = (log: LogPayload): void => {
+        return this.logger.logAction({...log, instigator: log.instigator || {
+            type: LogInstigatorType.user,
+            target: this.turn.currentTurn.id
+        } as LogInstigator }, this.processLoggingAction)
+    }
+
+    enableBots = (status: boolean) => {
+        this.turn.usersOrder.forEach(([user]) => {
+            if (user.type === UserType.bot && user instanceof Bot) {
+                user.setEnabled(status)
+            }
+        })
+    }
+}
+
+
+
+class DraftLogReader implements LogReader  {
+    stage: DraftFacade
+
+    constructor (stage: Draft) {
+        this.stage = new DraftFacade(stage)
+    }
+
+    readLog({ action, target }: Log): void {
+        if (action === LOG_ACTIONS.select_guild) {
+            this.stage.selectGuildByCode(target! as GuildCode)
+        }
+    }
+}
+
+class GameProcessLogReader implements LogReader {
+    stage: GameProcessFacade
+
+    constructor(stage: GameProcess) {
+        this.stage = new GameProcessFacade(stage)
+    }
+
+    readLog({ action, target }: Log): void {
+        switch(action) {
+            case LOG_ACTIONS.select_card:
+                this.stage.selectCardByCode(target!)
+                break;
+            case LOG_ACTIONS.select_field:
+                this.stage.selectFieldByCode(target!)
+                break;
+            case LOG_ACTIONS.stop_turn:
+                this.stage.stopTurn()
+                break;
+            default:
+                const [operation,, type] = action.split('_')
+                const spawnOperation = LOG_ACTIONS.spawnBy('guild').split('_')[0]
+                const activateOperation = LOG_ACTIONS.activateBy('guild').split('_')[0]
+
+                if (operation === spawnOperation) {
+                    this.stage.spawnCardByCode(target!, type as InteractionType)
+                } else if (operation === activateOperation) {
+                    this.stage.activateCardByCode(target!, type as InteractionType)
+                }
+        }
+    }
+}
+
 
 
 export class Chat implements ChatController {
@@ -2778,3 +5048,337 @@ export class Message {
 }
 
 
+
+abstract class Facade {
+    protected selectElement = (el: SelectiveElement | null | undefined) => {
+        if (el) {
+            el.select()
+        }
+    }
+}
+
+export class GameProcessFacade extends Facade {
+    process: GameProcess 
+
+    constructor(process: GameProcess) {
+        super()
+        this.process = process
+    }
+
+    draw = () => {
+        this.process.currentDeck().makeDraw()
+    }
+
+    getSequentialActionIterationIndex = () => {
+        const action = this.process.action.strategy as SequentialStrategy
+
+        if (action && action instanceof SequentialStrategy) {
+           return action.index
+        }
+        
+        return null
+    }
+
+    private interactWithCard = (card: Card | null | undefined, method: 'activate' | 'summon' , type: InteractionType) => {
+        if (card) {
+            card[method]()
+            this.choseGuildOrValue(type)
+        }
+    }
+
+    selectRandomCard = () => {
+        getRandomElement(this.getCurrentTurnAvailableCards()).select()
+    }
+
+    selectRandomField = () => {
+        getRandomElement(this.getAvailableFields()).select()
+    }
+
+    activateCardByIndex = (index: number, type: InteractionType) => {
+        const card = this.getCurrentTurnAvailableCards()[index]
+        this.interactWithCard(card, 'activate', type)
+        return card?.mobData.code
+    }
+
+    activateCardByCode = (code: string, type: InteractionType) => {
+        this.interactWithCard(this.getCurrentTurnAvailableCards().find(card => card.mobData.code === code), 'activate', type)
+    }
+
+    selectEmptyField = (row: number) => {
+        const fields = [] as Field[]
+        this.process.gameField.iterateThroughUserNodes(node => {
+            fields.push(node.fields.at(-1)!)
+        }, this.process.turn.currentTurn)
+
+        fields[row].select()
+    }
+
+    spawnCard = (index: number, type: InteractionType) => {
+        this.interactWithCard(this.getCurrentTurnAvailableCards()[index], 'summon', type)
+    }
+
+    spawnCardByCode = (code: string, type: InteractionType) => {
+        this.interactWithCard(this.getCurrentTurnAvailableCards().find(card => card.mobData.code === code), 'summon', type)
+    }
+
+    private interactWithSequentialAction = (cb: ((action: SequentialStrategy) => void)) => {
+        const action = this.process.action.strategy as SequentialStrategy
+        if (action && action instanceof SequentialStrategy) {
+           cb(action)
+        }
+    }
+
+    choseGuildOrValue = (type: InteractionType) => {
+        this.interactWithSequentialAction(action => {
+            if (type === 'guild') {
+                action.chooseGuild()
+            } else {
+                action.chooseValue()
+            }
+        })
+    }
+
+    selectCardByIndex = (index: number) => {
+        const card = this.getCurrentTurnAvailableCards()[index]
+        this.selectElement(card)
+        return card?.mobData.code
+    }
+
+    selectCardByCode = (code: string) => {
+        this.selectElement(this.getCurrentTurnAvailableCards().find(card => card.mobData.code === code))
+    }
+
+    selectFieldByIndex = (index: number) => {
+        const field = this.getAvailableFields()[index]
+        this.selectElement(field)
+        return field?.code
+    }
+
+    selectFieldByCode = (code: string) => {
+        this.selectElement(this.getAvailableFields().find(field => field.code === code))
+    }
+
+    getCurrentTurnHandCards = () => {
+        return this.process.currentDeck().hand.cards as Card[]
+    }
+
+    getCurrentTurnAvailableCards = () => {
+        return Array.from(this.process.currentDeck().highlighted) as Card[]
+    }
+
+    getAvailableFields = () => {
+        return  Array.from(this.process.gameField.highlighted) as Field[]
+    }
+
+    getCurrentTurnUserFields = () => {
+        return this.process.gameField.getUserFieldsInArray(this.process.turn.currentTurn)
+    }
+
+    getCurrentTurnTeamFields = () => {
+        return this.process.gameField.getTeamFieldsInArray(this.process.turn.currentTurnTeam)
+    }
+
+    stopTurn = () => {
+        this.interactWithSequentialAction(action => action.stopImmediately())
+    }
+
+    getEnemiesForCurrentTurnUserFields = () => {
+        return this.process.gameField.getEnemyFieldsForUserInArray(this.process.turn.currentTurn)
+    }
+
+    getEnemiesForCurrentTurnTeamFields = () => {
+        return this.process.gameField.getEnemyFieldsForTeamInArray(this.process.turn.currentTurnTeam)
+    }
+
+    getCountPointsForDraw = () => {
+        return this.process.gameField.calculateControllerNodesByUser(this.process.turn.currentTurn)
+    }
+}
+
+export class DraftFacade extends Facade {
+    draft: Draft
+
+    constructor(draft: Draft) {
+        super()
+        this.draft = draft
+    }
+
+    selectGuildByCode = (code: GuildCode) => {
+        this.draft.guilds.getConcreteGuildAsync(code)
+    }
+
+    selectGuildByIndex = (index: number) => {
+        const el = Array.from(this.draft.guilds.guilds)[index]
+        this.selectElement(el)
+        return el?.guild.code
+    }
+
+    takeRandomGuild = () => {
+        this.draft.guilds.takeRandomGuildAsync()
+    }
+}
+
+abstract class PlayerAPI {
+    protected session: string
+
+    constructor (session: string) {
+        this.session = session
+    }
+
+    abstract getGameSessionStartState(): Promise<Pick<PlayedGame, 'startState' | 'teams'>>
+}
+
+class RemotePlayerAPI extends PlayerAPI {
+    getGameSessionStartState = async () => {
+        return privateApi.get<Pick<PlayedGame, 'startState' | 'teams'>>('./').then(data => data.data)
+    }
+}
+
+class LocalPlayerAPI extends PlayerAPI {
+    getGameSessionStartState(): Promise<Pick<PlayedGame, 'teams' | 'startState'>> {
+        return new Promise((res, rej) => {
+            const lsData = localStorage.getItem(LS_PLAYED_GAMES_KEY)
+            const games: PlayedGame[] = lsData ? JSON.parse(lsData) : []
+            const found = games.find(({ id }) => id === this.session)
+
+            if (!found) {
+                rej('not such game')
+            } else {
+                res(found)
+            }
+        }) 
+    }
+}
+
+export class GamePlayer implements IStageController {
+    startState: InGameStageControllerDefaultData| undefined
+    keyframes: (Pick<ServerGameState, 'teams' | 'guilds'>)[] = []
+    stageController: IInGameStageController | undefined
+    keyframesInitialized: boolean = false
+    timer: Timer = new Timer()
+    currentLogIndex: number = -1
+    api: PlayerAPI
+    private applyState: ((state: ServerGameState) => void) | undefined
+
+    constructor(session: string, type: GameType) {
+        this.api = type === GameType.local ? new LocalPlayerAPI(session) : new RemotePlayerAPI(session)
+    }
+
+    start = async () => {
+        try {
+            const data = await this.api.getGameSessionStartState()
+            const { logs, guilds, users } = data.startState
+
+            this.startState = {
+                currentDuration: 0,
+                stage: InGameCode.draft,
+                paused: false,
+                periodStart: 0,
+                logs,
+                currentUser: null,
+                guilds: guilds as GuildCode[],
+                teams: data.teams.map(team => ({
+                    ...team,
+                    points: 0,
+                    users: team.users.map(user => users.find(u => u.id === user)!)
+                }))
+            }
+
+            let processLogCb: (log: Log) => void
+                const loggingAPI: ILoggingGameAPI = {
+                    getLog(cb) {
+                        processLogCb = cb
+                    },
+                    sendLog() {}
+                }       
+
+                this.stageController = new LogSyncrnoziedInGameStageControllerDecorator(
+                    new InGameStageController(this, true, this.startState),
+                    loggingAPI
+                )
+
+                this.stageController.enableBots(false)
+                this.stageController.start()
+
+                this.startState.logs.filter(({ type }) => type === 'util').forEach(log => {
+                    processLogCb && processLogCb(log)
+                    this.keyframes.push(this.stageController!.getEntityState())
+                })
+        } catch (_) {
+
+        }
+    }
+
+    printKeyframe = (index: number) => {
+        if (this.startState && this.stageController && index >= 0 && index < this.startState.logs.length) {
+            this.applyState && this.applyState(this.keyframes[index] as ServerGameState)
+        }
+    }
+
+    stop(): void {
+        if (this.startState) {
+            const syncronizingApi: ISyncGameAPI = {
+                onGameStateChange: (cb) =>{
+                    this.applyState = cb
+                },
+                pause: async () => {},
+                onPause: () => {},
+                setGameState: async () => {},
+            }
+
+            this.stageController = new SyncronizedInGameStageControllerDecorator(
+                new InGameStageController(this, true,
+                    { ...this.startState, currentUser: null }),
+                syncronizingApi
+            )
+
+           this.stageController.setTimer(this.timer)
+
+           this.timer.setSideEffect((time) => {
+               const observableLog = this.startState?.logs[this.currentLogIndex + 1]
+   
+               if (observableLog && observableLog.timestamp && observableLog.timestamp.seconds <= time) {
+                   this.currentLogIndex += 1
+               }
+           })
+
+           this.stageController.start()
+           this.keyframesInitialized = true
+        }
+    }
+
+    setConcreteTime = (seconds: number) => {
+        this.timer.setOffset(seconds)
+        let index = 0
+
+        this.startState?.logs.forEach((log, i) => {
+            if (log.timestamp && log.timestamp.seconds <= seconds) {
+                index = i
+            }
+        })
+
+        this.currentLogIndex = index
+    } 
+
+    pause = () => {
+        if (this.keyframesInitialized) {
+            this.timer.pause()
+        }
+    }
+
+    play = () => {
+        if (this.keyframesInitialized) {
+            this.timer.start()
+        }
+    }
+
+    getStage(): Stage<object, unknown, object> {
+        return this.stageController!.getStage()
+    }
+
+    setStage(_: Stage<object, unknown, object>): void {
+        
+    }
+}
+
+export { DraftStage }
